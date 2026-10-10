@@ -273,6 +273,33 @@ async def run_init(settings: OptimizationSettings):
     }
 
 
+def current_generation() -> int:
+    """Changes on every reset — lets a caller that prepares a preview state
+    outside of /run tell whether it was reset meanwhile."""
+    with _lock:
+        return _generation
+
+
+def init_mesh_path() -> str:
+    return _mesh_path()
+
+
+def install_init_result(result: dict[str, Any], range_info: dict, base: dict, generation: int) -> bool:
+    """Make ``result`` the auto-preview, as if /run had built it (used to
+    restore a saved project's heightmap; its mesh must already be written).
+
+    Returns False — leaving the state alone and releasing ``result`` — when
+    a build is running or a reset landed since ``generation`` was read."""
+    global _state, _pipeline_result
+    with _lock:
+        accepted = _generation == generation and _state["status"] != "initializing"
+        if accepted:
+            superseded, _pipeline_result = _pipeline_result, result
+            _state = {"status": "ready", "preview_image": None, "error": None, "range": range_info, "base": base}
+    release_pipeline_result(superseded if accepted else result)
+    return accepted
+
+
 @router.get("/status")
 async def init_status():
     with _lock:

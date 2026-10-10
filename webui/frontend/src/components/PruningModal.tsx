@@ -1,11 +1,25 @@
 import React, { useEffect, useMemo, useState } from 'react'
-import { Info, Loader2, Pause, Play, Scissors, Square, X } from 'lucide-react'
+import { Check, Info, Loader2, Pause, Play, Scissors, Sparkles, Square, Undo2, X } from 'lucide-react'
 import { useAppStore } from '../store/appStore'
 import { NumberInput } from './ui/number-input'
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from './ui/dialog'
+import { Tooltip, TooltipContent, TooltipTrigger } from './ui/tooltip'
 import { buildPrintPlan } from '../lib/printPlan'
 import { effectiveBaseFilamentUuid } from '../lib/baseColor'
-import { describePruningChange, liveCounts, resultCounts, suggestPruningLimits } from '../lib/pruning'
+import {
+  AUTO_PRUNE_PRESETS,
+  CUSTOM_PRUNE_LOSS_DEFAULT,
+  CUSTOM_PRUNE_LOSS_MAX,
+  CUSTOM_PRUNE_LOSS_MIN,
+  DEFAULT_AUTO_PRUNE_PRESET,
+  autoPrunePreset,
+  describeAutoOutcome,
+  describePruningChange,
+  liveCounts,
+  resultCounts,
+  suggestPruningLimits,
+  type AutoPrunePresetId,
+} from '../lib/pruning'
 
 const Current: React.FC<{ label: string; value: number; testId: string; from?: number }> = ({ label, value, testId, from }) => (
   <div className="flex-1 px-3 py-2 rounded bg-gray-800 text-center" data-testid={testId} data-value={value}>
@@ -95,6 +109,12 @@ export const PruningModal: React.FC = () => {
   const [limits, setLimits] = useState(() => suggestPruningLimits(current))
   const [error, setError] = useState<string | null>(null)
   const [startedHere, setStartedHere] = useState(false)
+  // Manual: the user sets every limit. Automatic: they pick how close to the
+  // image the result has to stay, and the passes lower the limits until that
+  // would be broken.
+  const [mode, setMode] = useState<'manual' | 'auto'>('auto')
+  const [presetId, setPresetId] = useState<AutoPrunePresetId | 'custom'>(DEFAULT_AUTO_PRUNE_PRESET)
+  const [customLoss, setCustomLoss] = useState(CUSTOM_PRUNE_LOSS_DEFAULT)
   // Pruning is a greedy search that restarts from whatever it is given, so
   // repeating it keeps gaining until it doesn't. Off by default: each pass is
   // real GPU time, and the user should choose to spend it.
@@ -121,11 +141,14 @@ export const PruningModal: React.FC = () => {
   const showProgress = running || (startedHere && !!pruningJob)
 
   const handleSubmit = async () => {
+    const target = presetId === 'custom' ? customLoss : autoPrunePreset(presetId).maxLoss
     setPruningSettings({
+      mode,
+      target_loss: mode === 'auto' ? target : null,
       pruning_max_colors: limits.colors,
       pruning_max_swaps: limits.swaps,
       pruning_max_layer: limits.layers,
-      auto_repeat: autoRepeat,
+      auto_repeat: mode === 'manual' && autoRepeat,
       max_passes: MAX_AUTO_PASSES,
       seed_search: polish.seedSearch,
       seed_search_count: polish.seedSearchCount,
@@ -169,12 +192,19 @@ export const PruningModal: React.FC = () => {
       ? `pass ${pruningJob.pruning_pass}${pruningJob.pruning_max_passes ? ` of ${pruningJob.pruning_max_passes}` : ''}`
       : null
 
+  const isAutoJob = typeof pruningJob?.auto_target_loss === 'number'
+  const autoPasses = pruningJob?.auto_passes ?? []
+
   const statusText = !pruningJob
     ? ''
     : pruningJob.status === 'completed'
-      ? 'Pruning finished — the color layers were updated.'
+      ? isAutoJob
+        ? describeAutoOutcome(pruningJob.auto_outcome, pruningJob.auto_target_loss)
+        : 'Pruning finished — the color layers were updated.'
       : pruningJob.status === 'cancelled'
-        ? 'Pruning cancelled. The result up to that point was kept.'
+        ? isAutoJob
+        ? 'Pruning cancelled. Your result is back to how it was before.'
+        : 'Pruning cancelled. The result up to that point was kept.'
         : pruningJob.status === 'failed'
           ? `Pruning failed: ${pruningJob.error ?? 'unknown error'}`
           : pruningJob.status === 'paused'
@@ -230,7 +260,9 @@ export const PruningModal: React.FC = () => {
                 >
                   {lossReadout.value.toFixed(2)}
                 </span>
-                <span className="ml-auto text-[11px] text-gray-500">lower is closer to the original</span>
+                <span className="ml-auto text-[11px] text-gray-500" data-testid="pruning-loss-hint">
+                  {isAutoJob ? `limit ${pruningJob?.auto_target_loss}` : 'lower is closer to the original'}
+                </span>
               </div>
             )}
           </div>
@@ -249,7 +281,29 @@ export const PruningModal: React.FC = () => {
               <div className="h-2 bg-gray-700 rounded-full overflow-hidden">
                 <div className="h-full bg-purple-500 transition-all" style={{ width: `${pruningJob.status === 'completed' ? 100 : pruningJob.progress}%` }} />
               </div>
-              {pruningJob.status === 'completed' && pruningBaseline && (
+              {isAutoJob && autoPasses.length > 0 && (
+                <ol className="space-y-1" data-testid="pruning-auto-passes">
+                  {autoPasses.map((p) => (
+                    <li
+                      key={p.pass}
+                      className={`flex items-center gap-2 px-2 py-1 rounded text-[11px] tabular-nums ${p.kept ? 'bg-gray-800 text-gray-200' : 'bg-amber-500/10 text-amber-400'}`}
+                      data-testid="pruning-auto-pass"
+                      data-kept={p.kept}
+                    >
+                      {p.kept ? <Check className="w-3 h-3 text-emerald-500" /> : <Undo2 className="w-3 h-3" />}
+                      <span>Pass {p.pass}</span>
+                      <span className="text-gray-400">
+                        {p.colors} colors · {p.swaps} swaps · {p.layers} layers
+                      </span>
+                      <span className="ml-auto">
+                        {typeof p.loss === 'number' ? p.loss.toFixed(2) : '—'}
+                        {p.kept ? '' : ' — over, undone'}
+                      </span>
+                    </li>
+                  ))}
+                </ol>
+              )}
+              {pruningJob.status === 'completed' && pruningBaseline && !isAutoJob && (
                 <>
                   <p className="text-xs text-gray-200" data-testid="pruning-summary">
                     {describePruningChange(pruningBaseline, current)}
@@ -260,6 +314,11 @@ export const PruningModal: React.FC = () => {
                     improving" to have it repeat on its own.
                   </p>
                 </>
+              )}
+              {pruningJob.status === 'completed' && pruningBaseline && isAutoJob && (
+                <p className="text-xs text-gray-200" data-testid="pruning-summary">
+                  {describePruningChange(pruningBaseline, current)}
+                </p>
               )}
               {running && (
                 <div className="flex gap-2">
@@ -280,6 +339,84 @@ export const PruningModal: React.FC = () => {
             </div>
           ) : (
             <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-1 p-1 rounded bg-gray-800" role="tablist" data-testid="pruning-mode-tabs">
+                {([['manual', 'Manual', Scissors], ['auto', 'Automatic', Sparkles]] as const).map(([id, label, Icon]) => (
+                  <button
+                    key={id}
+                    role="tab"
+                    aria-selected={mode === id}
+                    onClick={() => setMode(id)}
+                    className={`flex items-center justify-center gap-1.5 px-2 py-1.5 text-xs rounded ${mode === id ? 'bg-gray-600 text-gray-50' : 'text-gray-400 hover:text-gray-200'}`}
+                    data-testid={`pruning-mode-${id}`}
+                  >
+                    <Icon className="w-3.5 h-3.5" /> {label}
+                  </button>
+                ))}
+              </div>
+              {mode === 'auto' ? (
+                <div className="space-y-3" data-testid="pruning-auto-form">
+                  <p className="text-[11px] text-gray-300">
+                    Choose how close to your image the result has to stay. It first tries halving the colors, swaps and
+                    layers, then homes in on the most it can remove while staying within that quality — a handful of
+                    passes, with the result shown after each one. The last pass within the limit is kept.
+                  </p>
+                  <div className="grid grid-cols-2 gap-2" role="radiogroup" aria-label="Quality to keep">
+                    {AUTO_PRUNE_PRESETS.map((preset) => (
+                      <Tooltip key={preset.id}>
+                        <TooltipTrigger asChild>
+                          <button
+                            role="radio"
+                            aria-checked={presetId === preset.id}
+                            onClick={() => setPresetId(preset.id)}
+                            className={`px-3 py-2 rounded border text-left ${presetId === preset.id ? 'border-purple-500 bg-purple-500/15' : 'border-gray-700 bg-gray-800/60 hover:border-gray-500'}`}
+                            data-testid={`pruning-preset-${preset.id}`}
+                          >
+                            <div className="text-xs font-medium text-gray-100">{preset.label}</div>
+                            <div className="text-[11px] text-gray-400 tabular-nums">loss under {preset.maxLoss}</div>
+                          </button>
+                        </TooltipTrigger>
+                        <TooltipContent side="top" className="max-w-[16rem]" data-testid="pruning-preset-help">
+                          {preset.help}
+                        </TooltipContent>
+                      </Tooltip>
+                    ))}
+                  </div>
+                  <div
+                    className={`flex items-center gap-2 px-3 py-2 rounded border ${presetId === 'custom' ? 'border-purple-500 bg-purple-500/15' : 'border-gray-700 bg-gray-800/60 hover:border-gray-500'}`}
+                    data-testid="pruning-preset-custom"
+                  >
+                    <button
+                      role="radio"
+                      aria-checked={presetId === 'custom'}
+                      onClick={() => setPresetId('custom')}
+                      className="flex-1 text-left"
+                      data-testid="pruning-preset-custom-radio"
+                    >
+                      <div className="text-xs font-medium text-gray-100">Custom</div>
+                      <div className="text-[11px] text-gray-400">your own loss limit — lower keeps more of the image</div>
+                    </button>
+                    <span className="text-[11px] text-gray-400">loss under</span>
+                    <NumberInput
+                      value={customLoss}
+                      onValueChange={(v) => {
+                        setCustomLoss(v)
+                        setPresetId('custom')
+                      }}
+                      onFocus={() => setPresetId('custom')}
+                      min={CUSTOM_PRUNE_LOSS_MIN}
+                      max={CUSTOM_PRUNE_LOSS_MAX}
+                      className="w-20 text-xs bg-gray-900 border border-gray-600 rounded px-1.5 py-1 text-center text-gray-100"
+                      aria-label="Custom loss limit"
+                      data-testid="pruning-custom-loss"
+                    />
+                  </div>
+                  <p className="text-[11px] text-gray-400">
+                    Every pass is a full pruning run, so this takes a while. You can pause it, or cancel to put your
+                    result back as it was.
+                  </p>
+                </div>
+              ) : (
+              <>
               <p className="flex items-start gap-2 p-2.5 rounded bg-blue-500/10 border border-blue-500/30 text-[11px] text-gray-200" data-testid="pruning-repeat-hint">
                 <Info className="w-3.5 h-3.5 flex-shrink-0 mt-px text-blue-400" />
                 <span>
@@ -365,6 +502,8 @@ export const PruningModal: React.FC = () => {
                   </span>
                 </span>
               </label>
+              </>
+              )}
             </div>
           )}
 
@@ -381,7 +520,7 @@ export const PruningModal: React.FC = () => {
           </button>
           {!showProgress && (
             <button onClick={handleSubmit} className="flex items-center gap-1 px-3 py-1.5 text-xs text-white bg-purple-600 hover:bg-purple-500 rounded" data-testid="pruning-start-btn">
-              <Play className="w-3 h-3" /> Start pruning
+              <Play className="w-3 h-3" /> {mode === 'auto' ? 'Start automatic pruning' : 'Start pruning'}
             </button>
           )}
           {showProgress && !running && (

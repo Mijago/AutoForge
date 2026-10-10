@@ -21,6 +21,17 @@ import gc
 from typing import Any, Optional
 
 
+def _collect_garbage() -> None:
+    """A collection that waits out any CUDA graph capture running in another
+    thread: freeing a captured graph mid-capture invalidates the capture."""
+    try:
+        from autoforge.Helper.OptimizerHelper import collect_garbage
+    except Exception:  # torch-less environments (some unit tests)
+        gc.collect()
+        return
+    collect_garbage()
+
+
 def release_pipeline_result(result: Optional[dict[str, Any]]) -> None:
     """Drop every tensor a pipeline result holds and reclaim the memory.
 
@@ -56,7 +67,7 @@ def release_pipeline_result(result: Optional[dict[str, Any]]) -> None:
     except Exception:
         pass
 
-    gc.collect()
+    _collect_garbage()
     _empty_cache(device)
 
 
@@ -76,5 +87,5 @@ def _empty_cache(device: Any = None) -> None:
 def empty_device_cache(device: Any = None) -> None:
     """Public wrapper — used after a job finishes, where there is no result
     dict to release but the allocator is still holding freed blocks."""
-    gc.collect()
+    _collect_garbage()
     _empty_cache(device)

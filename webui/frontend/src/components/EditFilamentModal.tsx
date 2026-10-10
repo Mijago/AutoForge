@@ -1,4 +1,5 @@
 import React from 'react'
+import { HexColorInput } from './HexColorInput'
 import { useAppStore } from '../store/appStore'
 import type { Filament } from '../types'
 import { NumberInput } from './ui/number-input'
@@ -359,7 +360,15 @@ export const EditFilamentModal: React.FC = () => {
             </div>
             <div className="flex items-center gap-2">
               <label className="text-xs text-gray-400">Hex</label>
-              <input type="text" value={hexColor} readOnly className="text-xs bg-gray-800 border border-gray-600 rounded px-2 py-1 text-gray-200 font-mono w-24" />
+              <HexColorInput
+                value={hexColor}
+                onColor={({ r, g, b }) => {
+                  setColorR(r)
+                  setColorG(g)
+                  setColorB(b)
+                }}
+                data-testid="filament-hex-input"
+              />
               <input
                 type="color"
                 value={hexColor}

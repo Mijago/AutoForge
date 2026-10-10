@@ -24,6 +24,8 @@ from autoforge.Helper.OptimizerHelper import (
     EDGE_BLEED,
     set_edge_bleed,
     batched_layer_material_indices,
+    capture_guard,
+    collect_garbage,
     composite_graph_scope,
     composite_image_cont,
     composite_image_disc,
@@ -1204,7 +1206,7 @@ class FilamentOptimizer:
             self.optimizer.zero_grad(set_to_none=False)
 
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            with capture_guard(), torch.cuda.graph(graph):
                 captured_loss = self._forward_backward(tau_height, tau_global)
             # Keep only the storage, not the autograd graph - replays are pure
             # kernel replays and never touch autograd, and holding the graph
@@ -1223,7 +1225,8 @@ class FilamentOptimizer:
             # and check it against an eager step before handing the training
             # loop over to it. Costs one extra forward/backward, once.
             if not self._graph_replay_matches_eager(tau_height, tau_global):
-                graph.reset()
+                with capture_guard():
+                    graph.reset()
                 self._graph = None
                 self._graph_loss = None
                 self._graph_tau = None
@@ -1485,7 +1488,7 @@ class FilamentOptimizer:
             self._upd_table = torch.tensor(table, dtype=torch.float64).to(torch.float32).to(self.device)
             self._upd_j = torch.zeros((), dtype=torch.long, device=self.device)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            with capture_guard(), torch.cuda.graph(graph):
                 self._update_body()
             self._upd_graph = graph
             self._upd_n0 = n0
@@ -1573,14 +1576,16 @@ class FilamentOptimizer:
         # because something else synced in between. reset() releases the pool
         # explicitly instead of relying on the finalizer, and gc.collect()
         # then guarantees the object itself is gone before empty_cache().
-        self._graph.reset()
-        self._graph = None
-        self._graph_loss = None
-        self._graph_tau = None
-        if self._upd_graph is not None:
-            self._upd_graph.reset()
-            self._upd_graph = None
-        gc.collect()
+        # Not while another thread is capturing (see capture_guard).
+        with capture_guard():
+            self._graph.reset()
+            self._graph = None
+            self._graph_loss = None
+            self._graph_tau = None
+            if self._upd_graph is not None:
+                self._upd_graph.reset()
+                self._upd_graph = None
+        collect_garbage()
         synchronize(self.device)
         empty_cache(self.device)
 
@@ -2203,9 +2208,7 @@ class FilamentOptimizer:
 
         # clear pytorch and system cache to reduce vram usage
         empty_cache(self.device)
-        import gc
-
-        gc.collect()
+        collect_garbage()
         empty_cache(self.device)
 
         # Build a combined callback that updates the matplotlib window (CLI)

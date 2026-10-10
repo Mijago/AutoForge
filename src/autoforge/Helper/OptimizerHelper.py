@@ -1180,6 +1180,38 @@ _graph_state = threading.local()
 _capture_lock = threading.RLock()
 
 
+@contextmanager
+def capture_guard():
+    """Hold off everything that could reset a CUDA graph while one is being
+    captured. Freeing a captured graph (``CUDAGraph.reset``) is illegal during
+    a capture - "operation not permitted when stream is capturing" - and
+    invalidates it, which surfaced as "operation failed due to a previous
+    error during capture" in the middle of training. Graphs die in reference
+    cycles too (an old optimizer, a PaletteProxy), and the cyclic collector
+    runs whenever, in whichever thread allocates: so it is switched off for
+    the capture, and explicit collections elsewhere (``collect_garbage``)
+    wait for the same lock."""
+    import gc
+
+    with _capture_lock:
+        was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            yield
+        finally:
+            if was_enabled:
+                gc.enable()
+
+
+def collect_garbage() -> None:
+    """``gc.collect()``, but never in the middle of another thread's capture
+    (see ``capture_guard``)."""
+    import gc
+
+    with _capture_lock:
+        gc.collect()
+
+
 def _graph_thread_state():
     st = _graph_state
     if not hasattr(st, "depth"):
@@ -1282,7 +1314,7 @@ def _capture(fn, entry: dict, st, tensors: list, rest: tuple) -> None:
         # All of a thread's captured composites share one memory pool: they
         # are only ever replayed one at a time and their outputs are copied
         # out.
-        with torch.cuda.graph(
+        with capture_guard(), torch.cuda.graph(
             graph, pool=st.pool, capture_error_mode="thread_local"
         ):
             static_out = fn(*static_in, *rest)

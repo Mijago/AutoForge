@@ -89,3 +89,65 @@ export function liveMeshUrl(
   if (!['pending', 'running', 'paused'].includes(pruningJob.status)) return null
   return liveMesh.url
 }
+
+/** Quality levels for automatic pruning. `maxLoss` is the loss the result may
+ * not go over (the same number the dialog shows as "Difference from your
+ * image"; lower is closer to the original). Keep in step with
+ * helpers/auto_prune.py. */
+export const AUTO_PRUNE_PRESETS = [
+  {
+    id: 'extremely_good',
+    label: 'Extremely good',
+    maxLoss: 10,
+    help: 'Loss under 10. Practically indistinguishable from your image — only prunes what costs almost nothing, so expect a modest reduction.',
+  },
+  {
+    id: 'very_good',
+    label: 'Very good',
+    maxLoss: 20,
+    help: 'Loss under 20. A very faithful print with clearly fewer colors, swaps and layers.',
+  },
+  {
+    id: 'good',
+    label: 'Good',
+    maxLoss: 30,
+    help: 'Loss under 30. Faithful at a glance, with some fine detail and subtle color shifts traded away for a simpler print.',
+  },
+  {
+    id: 'acceptable',
+    label: 'Acceptable',
+    maxLoss: 40,
+    help: 'Loss under 40. Recognizably your image with visible simplification — the simplest print of the four.',
+  },
+] as const
+
+export type AutoPrunePresetId = (typeof AUTO_PRUNE_PRESETS)[number]['id']
+
+export const DEFAULT_AUTO_PRUNE_PRESET: AutoPrunePresetId = 'good'
+
+/** Your own loss limit instead of a preset: any positive number. */
+export const CUSTOM_PRUNE_LOSS_DEFAULT = 25
+export const CUSTOM_PRUNE_LOSS_MIN = 1
+export const CUSTOM_PRUNE_LOSS_MAX = 1000
+
+export function autoPrunePreset(id: string) {
+  return AUTO_PRUNE_PRESETS.find((p) => p.id === id) ?? AUTO_PRUNE_PRESETS[2]
+}
+
+/** What to tell the user once automatic pruning has finished, by the reason
+ * the backend stopped (`auto_outcome`). */
+export function describeAutoOutcome(outcome: string | null | undefined, targetLoss: number | null | undefined): string {
+  const limit = typeof targetLoss === 'number' ? ` ${targetLoss}` : ''
+  switch (outcome) {
+    case 'start_above_limit':
+      return `The result is already over the loss limit${limit}, so nothing was pruned. Pick a more relaxed level, or improve the result first.`
+    case 'limit_reached':
+      return `Stopped just before the loss limit${limit}: the next reduction would have gone over it, so the last pass under it was kept.`
+    case 'nothing_left':
+      return 'Nothing is left to reduce while staying within the loss limit.'
+    case 'pass_limit':
+      return 'Stopped at the pass limit; the last pass under the loss limit was kept.'
+    default:
+      return 'Automatic pruning finished.'
+  }
+}

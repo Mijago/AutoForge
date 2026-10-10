@@ -60,3 +60,14 @@ export function luminanceContrast(a: string, b: string): number {
   const darker = Math.min(la, lb)
   return (lighter + 0.05) / (darker + 0.05)
 }
+
+/** The color in whatever hex spelling a person pastes from the web: with or
+ * without `#`, `#RGB` shorthand, `#RRGGBBAA` (alpha dropped), surrounding
+ * whitespace or quotes. Null when it isn't a hex color. */
+export function parseHexInput(text: string): { r: number; g: number; b: number } | null {
+  let t = text.trim().replace(/^["']+|["']+$/g, '').replace(/^#|^0x/i, '')
+  if (!/^[a-f\d]+$/i.test(t)) return null
+  if (t.length === 3 || t.length === 4) t = [...t.slice(0, 3)].map((c) => c + c).join('')
+  else if (t.length === 8) t = t.slice(0, 6)
+  return t.length === 6 ? hexToRgb(t) : null
+}

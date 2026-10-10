@@ -538,6 +538,7 @@ def export_results(
     pause_event: Optional[threading.Event] = None,
     apply_spike_removal: bool = True,
     export_progress: Optional[Callable] = None,
+    prune_only: bool = False,
 ) -> Dict[str, Any]:
     """Generate STL, preview PNG, swap instructions, project file and
     colored PLY mesh from the state dict produced by ``run_pipeline()``.
@@ -546,6 +547,9 @@ def export_results(
     ----------
     result : dict
         State dict from ``run_pipeline()``.
+    prune_only : bool
+        Stop once pruning is done, before any file is written. Automatic
+        pruning runs many passes and only needs the files of the last one.
 
     Returns
     -------
@@ -702,6 +706,9 @@ def export_results(
                     pause_event=pause_event,
                     apply_spike_removal=apply_spike_removal,
                 )
+
+            if prune_only:
+                return {"pruning_completed": pruning_completed}
 
             disc_global, disc_height_image = optimizer.get_discretized_solution(
                 best=True

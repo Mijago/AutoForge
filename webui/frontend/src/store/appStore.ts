@@ -19,7 +19,8 @@ import { inheritRunInputs, readStoredRunInputs, storeRunInputs, type RunInputs }
 import { appendLossPoint, type LossPoint } from '../lib/lossHistory'
 import { suggestPruningLimits, resultCounts, type PruningCounts, type LiveMesh } from '../lib/pruning'
 import { buildPrintPlan } from '../lib/printPlan'
-import { effectiveBaseFilamentUuid } from '../lib/baseColor'
+import { effectiveBaseColor, effectiveBaseFilamentUuid } from '../lib/baseColor'
+import { blobToDataUrl, dataUrlToBlob, embeddedImageName, heightmapSource, isImageDataUrl, isSavedHeightmap, type SavedHeightmap } from '../lib/projectFile'
 import { projectFileName, projectFingerprint, projectNameFromFile } from '../lib/project'
 
 // Module-level undo stack — NOT in Zustand store to avoid infinite loops via subscribe
@@ -239,6 +240,49 @@ export function projectFileData(state: Pick<AppState, 'projectName' | 'inputImag
   }
 }
 
+async function uploadAsDataUrl(filename: string): Promise<string> {
+  const response = await fetch(`/api/images/${encodeURIComponent(filename)}`)
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  return blobToDataUrl(await response.blob())
+}
+
+async function uploadDataUrl(dataUrl: string, name: string): Promise<{ filename: string; url: string }> {
+  const form = new FormData()
+  form.append('file', dataUrlToBlob(dataUrl), embeddedImageName(dataUrl, name))
+  const response = await fetch('/api/images/upload', { method: 'POST', body: form })
+  if (!response.ok) throw new Error(describeApiError(await response.json().catch(() => null), response.status))
+  return response.json()
+}
+
+/** The project file as saved: projectFileData plus everything it needs to
+ * open on another machine — the image(s) and the heightmap the color layers
+ * were made for (see lib/projectFile). `missing` names what couldn't be
+ * included. */
+async function shareableProjectFile(state: AppState): Promise<{ data: Record<string, unknown>; missing: string[] }> {
+  const data: Record<string, unknown> = { ...projectFileData(state), version: 2, resolvedBase: state.resolvedBase }
+  const missing: string[] = []
+  const embed = async (filename: string, key: string, what: string) => {
+    try {
+      data[key] = await uploadAsDataUrl(filename)
+    } catch {
+      missing.push(what)
+    }
+  }
+  if (state.settings.input_image) await embed(state.settings.input_image, 'inputImageData', 'the image')
+  if (state.settings.priority_mask) await embed(state.settings.priority_mask, 'priorityMaskData', 'the focus areas')
+  const source = heightmapSource(state.currentJob, state.initState.status)
+  if (source) {
+    try {
+      const response = await fetch(`/api/project/heightmap?job_id=${encodeURIComponent(source)}`)
+      if (!response.ok) throw new Error(describeApiError(await response.json().catch(() => null), response.status))
+      data.heightmap = await response.json()
+    } catch (e) {
+      missing.push(`the heightmap (${e instanceof Error ? e.message : String(e)})`)
+    }
+  }
+  return { data, missing }
+}
+
 /** Fingerprint of everything a saved project file holds (see saveProjectToFile). */
 export function currentProjectFingerprint(state: Pick<AppState, 'projectName' | 'inputImage' | 'settings' | 'colorSliders' | 'activeFilaments'>): string {
   return projectFingerprint({
@@ -308,7 +352,7 @@ export const defaultSettings: OptimizationSettings = {
   spike_removal: true,
   spike_threshold_layers: 1,
   pixel_height_smoothness: 1.0,
-  edge_bleed: 0.25,
+  edge_bleed: 0.05,
   pruning_max_colors: 100,
   pruning_max_swaps: 100,
   pruning_max_layer: 75,
@@ -334,6 +378,8 @@ export const defaultSettings: OptimizationSettings = {
 }
 
 const defaultPruningSettings: PruningSettings = {
+  mode: 'manual',
+  target_loss: null,
   pruning_max_colors: 100,
   pruning_max_swaps: 100,
   pruning_max_layer: 75,
@@ -449,7 +495,7 @@ interface AppState {
   dismissSessionRestored: () => void
   startNewProject: () => void
   setProjectName: (name: string) => void
-  saveProjectToFile: () => void
+  saveProjectToFile: () => Promise<void>
   applySliders: (sliders: ColorSliderConfig[], range?: { min: number; max: number }) => void
   updateSlider: (index: number, updates: Partial<ColorSliderConfig>) => void
   setSettings: (settings: OptimizationSettings) => void
@@ -690,11 +736,14 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ projectName: name })
     writeStorage(PROJECT_NAME_KEY, name || null)
   },
-  saveProjectToFile: () => {
+  saveProjectToFile: async () => {
     flushPendingSnapshot()
     const state = get()
-    const data = projectFileData(state)
-    downloadBlob(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }), projectFileName(state.projectName))
+    const { data, missing } = await shareableProjectFile(state)
+    downloadBlob(new Blob([JSON.stringify(data)], { type: 'application/json' }), projectFileName(state.projectName))
+    if (missing.length > 0) {
+      get().pushToast(`Saved without ${missing.join(', ')} — the file won't fully open on another machine.`, 'warning')
+    }
     const fingerprint = currentProjectFingerprint(state)
     set({ savedProjectFingerprint: fingerprint })
     writeStorage(SAVED_FINGERPRINT_KEY, fingerprint)
@@ -894,6 +943,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           pruning_max_colors: limits.colors,
           pruning_max_swaps: limits.swaps,
           pruning_max_layer: limits.layers,
+          mode: 'manual',
           auto_repeat: false,
           seed_search: true,
           fine_tune_height: false,
@@ -978,101 +1028,38 @@ export const useAppStore = create<AppState>((set, get) => ({
       settings: OptimizationSettings
       activeFilaments: Filament[]
       inputImage: string | null
+      inputImageData: unknown
+      priorityMaskData: unknown
+      heightmap: unknown
+      resolvedBase: ResolvedBase | null
     }>
+    if (parsed.settings) parsed.settings = { ...parsed.settings }
 
-    const state = get()
-
-    // A loaded project's image is a different one than whatever was on
-    // screen (definitely — it's a different project), so every result
-    // derived from the *previous* image must go, the same way
-    // applyUploadedImage() clears it for a fresh upload. Leaving any of it
-    // in place is what showed the previous project's PLY under the loaded
-    // one, and re-rendered the new project's colors onto the old heightmap.
-    stopPruningPoll()
-    await fetch('/api/init/reset', { method: 'POST' }).catch(() => {})
-    set({
-      currentJob: null,
-      stlFile: null,
-      previewImage: null,
-      initState: { status: 'idle', preview_image: null },
-      initSkipImage: null,
-      hasRenderedInitPreview: false,
-      pruningJob: null,
-      pruningBaseline: null,
-      resolvedBase: null,
-      lossHistory: [],
-      lossJobId: null,
-      imageView: 'original',
-      hoveredBand: null,
-      // The loaded sliders may themselves reflect someone's earlier hand
-      // work, but nothing has been hand-edited in *this* session yet.
-      slidersEditedByHand: false,
-    })
-
-    // Sync the backend's active-filament list to match the file — clear
-    // what's active now, then re-add what the file specifies. A filament
-    // referenced by the file but missing from the current library (e.g.
-    // loaded on a different machine/profile) is created first so the
-    // reference doesn't silently dangle.
-    if (Array.isArray(parsed.activeFilaments)) {
-      const libraryRes = await fetch('/api/filaments')
-      const library: Filament[] = await libraryRes.json().catch(() => [])
-      const libraryUuids = new Set(library.map((f) => f.uuid))
-      const { libraryChanged, failed } = await addMissingFilaments(parsed.activeFilaments, libraryUuids, async (f) => {
-        const response = await fetch('/api/filaments', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(f),
-        })
-        const detail = response.ok ? undefined : describeApiError(await response.json().catch(() => null), response.status)
-        return { ok: response.ok, status: response.status, detail }
-      })
-      // Refused filaments stay out of the active list (the server would
-      // reject the whole list for one bad entry), and the user is told which.
-      const refused = new Set(failed.map(({ filament }) => filament.uuid))
-      const usable = parsed.activeFilaments.filter((f) => !refused.has(f.uuid))
-      if (failed.length > 0) {
-        get().pushToast(
-          `Skipped ${failed.length} filament${failed.length > 1 ? 's' : ''} from the project the server refused: ` +
-            failed.map(({ filament, detail }) => `${filamentLabel(filament)} (${detail})`).join('; '),
-          'warning',
-        )
-      }
-      parsed.activeFilaments = usable
+    // The file carries its own image(s): put them on this server first, so
+    // the project opens the same wherever it was saved.
+    if (parsed.settings && isImageDataUrl(parsed.inputImageData)) {
+      const uploaded = await uploadDataUrl(parsed.inputImageData, 'project-image')
+      parsed.settings.input_image = uploaded.filename
+      parsed.inputImage = uploaded.url
+    }
+    if (parsed.settings && isImageDataUrl(parsed.priorityMaskData)) {
       try {
-        await syncActiveFilamentsToServer(parsed.activeFilaments)
-      } catch (e) {
-        get().pushToast(`Failed to save the project's active filaments on the server: ${e instanceof Error ? e.message : String(e)}`)
+        parsed.settings.priority_mask = (await uploadDataUrl(parsed.priorityMaskData, 'focus-areas')).filename
+      } catch {
+        parsed.settings.priority_mask = ''
       }
-      if (libraryChanged) {
-        const refreshed = await fetch('/api/filaments')
-        set({ filaments: await refreshed.json().catch(() => library) })
-      }
-      get().setActiveFilaments(parsed.activeFilaments)
     }
+    const savedHeightmap: SavedHeightmap | null = isSavedHeightmap(parsed.heightmap) && parsed.settings?.input_image ? parsed.heightmap : null
 
-    if (parsed.settings) {
-      const settings = { ...state.settings, ...parsed.settings }
-      // The project may come from another machine, whose uploads/ this
-      // server doesn't have: a missing focus mask failed the next Run ("mask
-      // not found") and a missing image showed a broken picture.
-      const missing = await missingUploads([settings.input_image, settings.priority_mask])
-      if (settings.priority_mask && missing.has(settings.priority_mask)) settings.priority_mask = ''
-      if (settings.input_image && missing.has(settings.input_image)) {
-        get().pushToast("The project's image isn't on this server; upload it again.", 'warning')
-        settings.input_image = ''
-        parsed.inputImage = null
-      }
-      get().setSettings(settings)
-      // The previous project's heightmap bounds must not clamp this one's bands.
-      set({ sliderLayerRange: { min: 0, max: settings.max_layers || 75 } })
+    // Counted as an init request while the saved heightmap is restored: the
+    // auto-preview must neither be built from the photo meanwhile
+    // (useAutoPreviewInit) nor reported idle by the status poll.
+    if (savedHeightmap) initRequestsInFlight += 1
+    try {
+      await applyProjectFile(parsed, savedHeightmap, fileName, data)
+    } finally {
+      if (savedHeightmap) initRequestsInFlight -= 1
     }
-    if (Array.isArray(parsed.colorSliders)) get().setSliders(parsed.colorSliders)
-    if (parsed.inputImage !== undefined) get().setInputImage(parsed.inputImage)
-    get().setProjectName(projectNameFromFile((data as { name?: unknown }).name, fileName ?? ''))
-    const fingerprint = currentProjectFingerprint(get())
-    set({ savedProjectFingerprint: fingerprint, sessionRestored: false, selectedBand: null })
-    writeStorage(SAVED_FINGERPRINT_KEY, fingerprint)
   },
 
   setResolvedBase: (base) => set({ resolvedBase: base }),
@@ -1658,6 +1645,150 @@ async function applySnapshot(index: number) {
       deferredCaptureLabel = undefined
       queueCaptureSnapshot(label)
     }
+  }
+}
+
+type ParsedProjectFile = Partial<{
+  colorSliders: ColorSliderConfig[]
+  settings: OptimizationSettings
+  activeFilaments: Filament[]
+  inputImage: string | null
+  resolvedBase: ResolvedBase | null
+}>
+
+async function applyProjectFile(parsed: ParsedProjectFile, savedHeightmap: SavedHeightmap | null, fileName: string | undefined, data: unknown) {
+    // A loaded project's image is a different one than whatever was on
+    // screen (definitely — it's a different project), so every result
+    // derived from the *previous* image must go, the same way
+    // applyUploadedImage() clears it for a fresh upload. Leaving any of it
+    // in place is what showed the previous project's PLY under the loaded
+    // one, and re-rendered the new project's colors onto the old heightmap.
+    stopPruningPoll()
+    await fetch('/api/init/reset', { method: 'POST' }).catch(() => {})
+    useAppStore.setState({
+      currentJob: null,
+      stlFile: null,
+      previewImage: null,
+      initState: { status: savedHeightmap ? 'initializing' : 'idle', preview_image: null },
+      initSkipImage: null,
+      hasRenderedInitPreview: false,
+      pruningJob: null,
+      pruningBaseline: null,
+      resolvedBase: null,
+      lossHistory: [],
+      lossJobId: null,
+      imageView: 'original',
+      hoveredBand: null,
+      // The loaded sliders may themselves reflect someone's earlier hand
+      // work, but nothing has been hand-edited in *this* session yet.
+      slidersEditedByHand: false,
+    })
+
+    // Sync the backend's active-filament list to match the file — clear
+    // what's active now, then re-add what the file specifies. A filament
+    // referenced by the file but missing from the current library (e.g.
+    // loaded on a different machine/profile) is created first so the
+    // reference doesn't silently dangle.
+    if (Array.isArray(parsed.activeFilaments)) {
+      const libraryRes = await fetch('/api/filaments')
+      const library: Filament[] = await libraryRes.json().catch(() => [])
+      const libraryUuids = new Set(library.map((f) => f.uuid))
+      const { libraryChanged, failed } = await addMissingFilaments(parsed.activeFilaments, libraryUuids, async (f) => {
+        const response = await fetch('/api/filaments', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(f),
+        })
+        const detail = response.ok ? undefined : describeApiError(await response.json().catch(() => null), response.status)
+        return { ok: response.ok, status: response.status, detail }
+      })
+      // Refused filaments stay out of the active list (the server would
+      // reject the whole list for one bad entry), and the user is told which.
+      const refused = new Set(failed.map(({ filament }) => filament.uuid))
+      const usable = parsed.activeFilaments.filter((f) => !refused.has(f.uuid))
+      if (failed.length > 0) {
+        useAppStore.getState().pushToast(
+          `Skipped ${failed.length} filament${failed.length > 1 ? 's' : ''} from the project the server refused: ` +
+            failed.map(({ filament, detail }) => `${filamentLabel(filament)} (${detail})`).join('; '),
+          'warning',
+        )
+      }
+      parsed.activeFilaments = usable
+      try {
+        await syncActiveFilamentsToServer(parsed.activeFilaments)
+      } catch (e) {
+        useAppStore.getState().pushToast(`Failed to save the project's active filaments on the server: ${e instanceof Error ? e.message : String(e)}`)
+      }
+      if (libraryChanged) {
+        const refreshed = await fetch('/api/filaments')
+        useAppStore.setState({ filaments: await refreshed.json().catch(() => library) })
+      }
+      useAppStore.getState().setActiveFilaments(parsed.activeFilaments)
+    }
+
+    if (parsed.settings) {
+      const settings = { ...useAppStore.getState().settings, ...parsed.settings }
+      // The project may come from another machine, whose uploads/ this
+      // server doesn't have: a missing focus mask failed the next Run ("mask
+      // not found") and a missing image showed a broken picture.
+      const missing = await missingUploads([settings.input_image, settings.priority_mask])
+      if (settings.priority_mask && missing.has(settings.priority_mask)) settings.priority_mask = ''
+      if (settings.input_image && missing.has(settings.input_image)) {
+        useAppStore.getState().pushToast("The project's image isn't on this server; upload it again.", 'warning')
+        settings.input_image = ''
+        parsed.inputImage = null
+      }
+      useAppStore.getState().setSettings(settings)
+      // The previous project's heightmap bounds must not clamp this one's bands.
+      useAppStore.setState({ sliderLayerRange: { min: 0, max: settings.max_layers || 75 } })
+    }
+    if (Array.isArray(parsed.colorSliders)) useAppStore.getState().setSliders(parsed.colorSliders)
+    if (parsed.inputImage !== undefined) useAppStore.getState().setInputImage(parsed.inputImage)
+    if (savedHeightmap) await restoreSavedHeightmap(savedHeightmap, parsed.resolvedBase ?? null)
+    useAppStore.getState().setProjectName(projectNameFromFile((data as { name?: unknown }).name, fileName ?? ''))
+    const fingerprint = currentProjectFingerprint(useAppStore.getState())
+    useAppStore.setState({ savedProjectFingerprint: fingerprint, sessionRestored: false, selectedBand: null })
+    writeStorage(SAVED_FINGERPRINT_KEY, fingerprint)
+}
+
+/** Shows the loaded project's own heightmap as the preview — the surface
+ * its color layers were made for — instead of building one from the photo.
+ * If the server can't take it, the preview is built from the photo as for
+ * any new image. */
+async function restoreSavedHeightmap(saved: SavedHeightmap, base: ResolvedBase | null) {
+  const store = useAppStore.getState()
+  const forImage = store.settings.input_image
+  try {
+    const response = await fetch('/api/project/heightmap', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        heightmap: saved.heightmap,
+        alpha: saved.alpha ?? null,
+        settings: store.settings,
+        sliders: store.colorSliders,
+        active_filaments: store.activeFilaments,
+        background_color: effectiveBaseColor(store.settings, base),
+        base,
+      }),
+    })
+    if (!response.ok) throw new Error(describeApiError(await response.json().catch(() => null), response.status))
+    const result = await response.json()
+    if (useAppStore.getState().settings.input_image !== forImage) return
+    useAppStore.setState({
+      initState: { status: 'ready', preview_image: null },
+      resolvedBase: base ?? (result.base as ResolvedBase) ?? null,
+      ...(Number.isFinite(result.min_layer) && Number.isFinite(result.max_layer)
+        ? { sliderLayerRange: { min: result.min_layer, max: result.max_layer } }
+        : {}),
+    })
+    useAppStore.getState().bumpPreviewVersion()
+  } catch (e) {
+    useAppStore.setState({ initState: { status: 'idle', preview_image: null } })
+    useAppStore.getState().pushToast(
+      `Couldn't restore the project's heightmap (${e instanceof Error ? e.message : String(e)}); building a new preview from the image instead.`,
+      'warning',
+    )
   }
 }
 

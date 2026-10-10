@@ -98,6 +98,11 @@ export interface JobStatus {
   pruning_max_passes?: number | null
   /** The loss pruning started from; `loss` carries the live value. */
   pruning_start_loss?: number | null
+  /** Automatic pruning (see models.JobStatus): the loss it stays under, one
+   * entry per finished pass, and why it stopped. */
+  auto_target_loss?: number | null
+  auto_passes?: AutoPrunePass[] | null
+  auto_outcome?: string | null
   /** The input image this job ran on, and whether it's a FlatForge run (see
    * models.JobStatus) — both absent on jobs recorded before these fields
    * existed. Used to tell whether a restored/latest job actually belongs to
@@ -106,7 +111,21 @@ export interface JobStatus {
   flatforge?: boolean | null
 }
 
+export interface AutoPrunePass {
+  pass: number
+  colors: number | null
+  swaps: number | null
+  layers: number | null
+  loss: number | null
+  /** False when the pass went over the loss limit and was undone. */
+  kept: boolean
+}
+
 export interface PruningSettings {
+  /** 'auto' lowers the limits itself until the loss would go over
+   * `target_loss`; the three limits below are then ignored. */
+  mode: 'manual' | 'auto'
+  target_loss: number | null
   pruning_max_colors: number
   pruning_max_swaps: number
   pruning_max_layer: number

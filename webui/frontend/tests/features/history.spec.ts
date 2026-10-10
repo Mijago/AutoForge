@@ -215,7 +215,7 @@ test.describe('Project files', () => {
     await byTestId(page, 'file-menu-btn').click()
     const [download] = await Promise.all([page.waitForEvent('download'), byTestId(page, 'file-menu-save').click()])
     const saved = JSON.parse(fs.readFileSync(await download.path(), 'utf8'))
-    expect(saved).toMatchObject({ version: 1, settings: { layer_height: 0.12 } })
+    expect(saved).toMatchObject({ version: 2, settings: { layer_height: 0.12 } })
     expect(saved.colorSliders[0].td).toBe(4.2)
     expect(saved.activeFilaments.map((f: any) => f.uuid)).toEqual([a.uuid])
 

@@ -25,6 +25,7 @@ import torch.nn.functional as F
 
 from autoforge.Helper.ImageHelper import srgb_to_lab
 from autoforge.Helper.OptimizerHelper import (
+    capture_guard,
     _coverage,
     composite_graph_scope,
     composite_image_disc,
@@ -726,7 +727,7 @@ class PaletteProxy:
                 return self._eval(dg)
             static_in = dg.clone()
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=self._pool, capture_error_mode="thread_local"):
+            with capture_guard(), torch.cuda.graph(graph, pool=self._pool, capture_error_mode="thread_local"):
                 static_out = self._eval(static_in)
             entry.update(graph=graph, inp=static_in, out=static_out)
         entry["inp"].copy_(dg)
@@ -818,7 +819,7 @@ class _LayerStep:
                 self.fn(self.layer)
                 return
             g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g, pool=self.pool, capture_error_mode="thread_local"):
+            with capture_guard(), torch.cuda.graph(g, pool=self.pool, capture_error_mode="thread_local"):
                 self.fn(self.layer)
             self.graph = g
         self.graph.replay()

@@ -203,6 +203,13 @@ class JobStatus(CamelCaseModel):
     # The loss pruning started from, so the UI can show what it has gained
     # (`loss` carries the live value). Lower is closer to the input image.
     pruning_start_loss: Optional[float] = None
+    # Automatic pruning (see PruningSettings.mode): the loss it must stay
+    # under, one entry per finished pass ({pass, colors, swaps, layers, loss,
+    # kept}), and why it stopped (helpers/auto_prune.py outcomes, or
+    # "start_above_limit" when the result was over the limit to begin with).
+    auto_target_loss: Optional[float] = None
+    auto_passes: Optional[list[dict]] = None
+    auto_outcome: Optional[str] = None
 
 
 class PruningSettings(CamelCaseModel):
@@ -212,6 +219,11 @@ class PruningSettings(CamelCaseModel):
     pruning_max_swaps: int = Field(100, ge=0)
     pruning_max_layer: int = Field(75, ge=1)
     job_id: Optional[str] = None
+    # "auto" ignores the three limits above: it lowers them pass by pass
+    # until the loss would go over `target_loss`, and keeps the last pass
+    # that was still under it.
+    mode: Literal["manual", "auto"] = "manual"
+    target_loss: Optional[float] = Field(None, gt=0)
     # Keep pruning the same result until a pass stops finding an
     # improvement. Pruning is a greedy search that restarts from whatever it
     # is given, so repeated passes keep gaining — but only up to a point, and
@@ -230,6 +242,12 @@ class PruningSettings(CamelCaseModel):
     seed_search_count: int = Field(200, ge=1, le=20000)
     fine_tune_height: bool = False
     fine_tune_steps: int = Field(50, ge=1, le=2000)
+
+    @model_validator(mode="after")
+    def _auto_needs_target(self):
+        if self.mode == "auto" and self.target_loss is None:
+            raise ValueError("Automatic pruning needs a target loss.")
+        return self
 
 
 class StateSnapshot(CamelCaseModel):

@@ -9,6 +9,7 @@ import torch
 from fastapi import APIRouter, HTTPException
 from ..models import PruningSettings
 from ..services.optimization_service import get_optimization_service
+from ..helpers.auto_prune import AutoPruneSearch
 from ..helpers.pipeline_runner import friendly_error_message
 from ..helpers.sliders import result_counts_from_optimizer, should_repeat_prune
 from ..helpers.telemetry import capture_exception
@@ -116,6 +117,8 @@ async def start_pruning(settings: PruningSettings):
         broadcast = rollback.get("broadcast")
         if broadcast is not None:
             broadcast()
+
+    auto = settings.mode == "auto"
 
     def _run():
         try:
@@ -230,8 +233,9 @@ async def start_pruning(settings: PruningSettings):
                 *(["Searching layer stacks"] if pixel_refine and getattr(args, "stack_search", True) else []),
                 *(["Refining pixel heights"] if pixel_refine else []),
                 *(["Removing spikes"] if getattr(args, "spike_removal", True) else []),
-                # Writing the pruned result's files (export_results).
-                "Saving the result",
+                # Writing the pruned result's files (export_results). Automatic
+                # pruning only writes them once, after its last pass.
+                *([] if auto else ["Saving the result"]),
             ]
             # Slices weighted by how long each step usually takes, so the bar
             # moves at a roughly even pace.
@@ -274,6 +278,8 @@ async def start_pruning(settings: PruningSettings):
             _pass = 1
 
             def _pass_fields() -> dict:
+                if auto:
+                    return {"pruning_pass": _pass}
                 if not settings.auto_repeat:
                     return {}
                 return {"pruning_pass": _pass, "pruning_max_passes": settings.max_passes}
@@ -463,6 +469,151 @@ async def start_pruning(settings: PruningSettings):
                 prune_job_id, "running", pruning_start_loss=start_loss, loss=start_loss,
             )
 
+            def _clone_solution(snapshot: dict) -> dict:
+                """A snapshot that later pruning can't change: the live
+                optimizer takes over whatever dict it is restored from, and
+                pruning mutates those tensors in place."""
+                out = dict(snapshot)
+                out["best_params"] = {
+                    k: (v.detach().clone() if isinstance(v, torch.Tensor) else v)
+                    for k, v in snapshot["best_params"].items()
+                }
+                logits = snapshot.get("pixel_height_logits")
+                if isinstance(logits, torch.Tensor):
+                    out["pixel_height_logits"] = logits.detach().clone()
+                return out
+
+            def _cancelled_while_waiting() -> bool:
+                """Blocks while paused; True if the job was cancelled."""
+                while pause_event is not None and pause_event.is_set():
+                    if cancel_event is not None and cancel_event.is_set():
+                        return True
+                    time.sleep(0.1)
+                return cancel_event is not None and cancel_event.is_set()
+
+            auto_result: dict = {}
+
+            def _run_auto_passes() -> tuple[str | None, bool]:
+                """Automatic pruning: lower the limits pass by pass while the
+                loss stays within the target, and finish on the last pass that
+                did. A pass that goes over is undone, so what is left in the
+                optimizer is always the last good solution. Returns
+                (why it stopped, whether it was cancelled)."""
+                nonlocal _pass, _last
+                target = float(settings.target_loss)
+                passes_log: list[dict] = []
+
+                def publish(**fields) -> None:
+                    svc.update_status(
+                        prune_job_id, "running", auto_target_loss=target,
+                        auto_passes=list(passes_log), **fields,
+                    )
+
+                start = start_loss
+                if not getattr(optimizer, "_full_res_height_restored", False):
+                    # A result's first export switches it to the output
+                    # resolution, and the loss is only comparable with the
+                    # target from there on (the start loss above was measured
+                    # before that). Nothing is pruned or written yet.
+                    args.perform_pruning = False
+                    export_results(
+                        pipeline_result, cancel_event=cancel_event, pause_event=pause_event, prune_only=True,
+                    )
+                    args.perform_pruning = True
+                    start = _discrete_loss()
+                    svc.update_status(prune_job_id, "running", pruning_start_loss=start, loss=start)
+                good_counts = result_counts_from_optimizer(optimizer)
+                if start is None or good_counts is None:
+                    raise RuntimeError("Couldn't measure this result, so there is nothing to compare the target against.")
+                good_loss = start
+                good = _clone_solution(optimizer.solution_snapshot())
+                publish()
+
+                outcome: str | None = "start_above_limit"
+                if start <= target:
+                    search = AutoPruneSearch(good_counts, min_layers=int(getattr(args, "min_layers", 1)))
+                    while True:
+                        if _cancelled_while_waiting():
+                            return None, True
+                        limits = search.propose(good_counts)
+                        if limits is None:
+                            outcome = search.outcome
+                            break
+                        _pass = search.passes
+                        # Each pass starts its own 0-100 sweep.
+                        _last = 0.0
+                        _phase_min_seen.clear()
+                        _counts_state["value"] = None
+                        args.pruning_max_colors = limits["colors"]
+                        args.pruning_max_swaps = limits["swaps"]
+                        args.pruning_max_layer = limits["layers"]
+                        publish(progress=0.0, phase=phases[0], **_live_counts(), **_pass_fields())
+
+                        # Spike removal on every pass: it changes the loss, and
+                        # the decision has to be made on what would be printed.
+                        outputs = export_results(
+                            pipeline_result,
+                            cancel_event=cancel_event,
+                            pause_event=pause_event,
+                            apply_spike_removal=True,
+                            prune_only=True,
+                        )
+                        if not outputs.get("pruning_completed", True) or (
+                            cancel_event is not None and cancel_event.is_set()
+                        ):
+                            return None, True
+
+                        loss = _discrete_loss()
+                        counts = result_counts_from_optimizer(optimizer)
+                        kept = loss is not None and counts is not None and loss <= target
+                        passes_log.append({
+                            "pass": _pass,
+                            "colors": counts["colors"] if counts else None,
+                            "swaps": counts["swaps"] if counts else None,
+                            "layers": counts["layers"] if counts else None,
+                            "loss": loss,
+                            "kept": kept,
+                        })
+                        if kept:
+                            good = _clone_solution(optimizer.solution_snapshot())
+                            good_counts, good_loss = counts, loss
+                            search.accept()
+                        else:
+                            optimizer.restore_solution_snapshot(_clone_solution(good))
+                            search.reject()
+                        _counts_state["value"] = None
+                        # The preview between passes: the kept result, or the
+                        # one it went back to.
+                        _broadcast_result()
+                        publish(
+                            progress=100.0,
+                            phase="Pruned" if kept else "Over the limit, going back",
+                            loss=good_loss, **_live_counts(), **_pass_fields(),
+                        )
+                        if search.outcome is not None:
+                            outcome = search.outcome
+                            break
+
+                # Only now are the result's files written, for the solution
+                # the optimizer holds - the last good one.
+                args.perform_pruning = False
+                args.pruning_max_colors = good_counts["colors"]
+                args.pruning_max_swaps = good_counts["swaps"]
+                args.pruning_max_layer = good_counts["layers"]
+                publish(progress=0.0, phase="Saving the result", loss=good_loss, **_pass_fields())
+                export_results(
+                    pipeline_result,
+                    cancel_event=cancel_event,
+                    pause_event=pause_event,
+                    export_progress=lambda f: svc.update_status(
+                        prune_job_id, "running", progress=100.0 * f, phase="Saving the result",
+                    ),
+                )
+                if cancel_event is not None and cancel_event.is_set():
+                    return None, True
+                auto_result.update(auto_outcome=outcome, loss=good_loss, auto_passes=passes_log)
+                return outcome, False
+
             # Spike removal is a printability trade-off (see
             # Optimizer.post_remove_spikes), not part of the color/swap/layer
             # search — running it every auto-repeat pass paid its accuracy
@@ -474,67 +625,70 @@ async def start_pruning(settings: PruningSettings):
             # convergence check just below decided to stop and scheduled one
             # extra pass purely to finish with spikes cleaned up.
             final_spike_pass = False
-            while True:
-                # Each pass starts its own 0-100 sweep.
-                _last = 0.0
-                _phase_min_seen.clear()
-                _counts_state["value"] = None
-                # Publish the starting counts immediately: the dialog opens on
-                # "Reducing colors" with the bar at 0, and showing "—" there
-                # until the first callback landed looked like a stall.
-                svc.update_status(
-                    prune_job_id, "running", progress=0.0, phase=phases[0],
-                    **_live_counts(), **_pass_fields(),
-                )
+            if auto:
+                _outcome, cancelled_midway = _run_auto_passes()
+            else:
+                while True:
+                    # Each pass starts its own 0-100 sweep.
+                    _last = 0.0
+                    _phase_min_seen.clear()
+                    _counts_state["value"] = None
+                    # Publish the starting counts immediately: the dialog opens on
+                    # "Reducing colors" with the bar at 0, and showing "—" there
+                    # until the first callback landed looked like a stall.
+                    svc.update_status(
+                        prune_job_id, "running", progress=0.0, phase=phases[0],
+                        **_live_counts(), **_pass_fields(),
+                    )
 
-                apply_spikes = (not settings.auto_repeat) or final_spike_pass
-                outputs = export_results(
-                    pipeline_result,
-                    cancel_event=cancel_event,
-                    pause_event=pause_event,
-                    apply_spike_removal=apply_spikes,
-                    export_progress=lambda f: _prune_progress(optimizer, 100.0 * f, phase="Saving the result"),
-                )
-                # Cancelled between phases. The frontend stays on the result
-                # pruning started from, so the solution is rolled back to it
-                # below (_roll_back) rather than left half-pruned.
-                # A cancel that arrived after the last phase, while the result
-                # was being saved, counts too: the job is "cancelled" already.
-                if not outputs.get("pruning_completed", True) or (
-                    cancel_event is not None and cancel_event.is_set()
-                ):
-                    cancelled_midway = True
-                    break
+                    apply_spikes = (not settings.auto_repeat) or final_spike_pass
+                    outputs = export_results(
+                        pipeline_result,
+                        cancel_event=cancel_event,
+                        pause_event=pause_event,
+                        apply_spike_removal=apply_spikes,
+                        export_progress=lambda f: _prune_progress(optimizer, 100.0 * f, phase="Saving the result"),
+                    )
+                    # Cancelled between phases. The frontend stays on the result
+                    # pruning started from, so the solution is rolled back to it
+                    # below (_roll_back) rather than left half-pruned.
+                    # A cancel that arrived after the last phase, while the result
+                    # was being saved, counts too: the job is "cancelled" already.
+                    if not outputs.get("pruning_completed", True) or (
+                        cancel_event is not None and cancel_event.is_set()
+                    ):
+                        cancelled_midway = True
+                        break
 
-                _broadcast_result()
-                loss = _discrete_loss()
-                _counts_state["value"] = None
-                svc.update_status(
-                    prune_job_id, "running", progress=100.0, phase="Pruned",
-                    loss=loss, **_live_counts(), **_pass_fields(),
-                )
+                    _broadcast_result()
+                    loss = _discrete_loss()
+                    _counts_state["value"] = None
+                    svc.update_status(
+                        prune_job_id, "running", progress=100.0, phase="Pruned",
+                        loss=loss, **_live_counts(), **_pass_fields(),
+                    )
 
-                if not settings.auto_repeat or final_spike_pass:
-                    break
-                if cancel_event is not None and cancel_event.is_set():
-                    cancelled_midway = True
-                    break
-                repeat, reason = should_repeat_prune(_pass, max_passes, loss, best_loss)
-                if loss is not None and (best_loss is None or loss < best_loss):
-                    best_loss = loss
-                if not repeat:
-                    print(f"Auto-repeat pruning: stopping after pass {_pass} — {reason}.")
-                    if getattr(args, "spike_removal", True):
-                        # One more pass, purely to clean up spikes on the
-                        # converged result — everything else is already
-                        # within its limits so the reduction phases exit
-                        # immediately, leaving only the spike pass to do
-                        # real work.
-                        final_spike_pass = True
-                        _pass += 1
-                        continue
-                    break
-                _pass += 1
+                    if not settings.auto_repeat or final_spike_pass:
+                        break
+                    if cancel_event is not None and cancel_event.is_set():
+                        cancelled_midway = True
+                        break
+                    repeat, reason = should_repeat_prune(_pass, max_passes, loss, best_loss)
+                    if loss is not None and (best_loss is None or loss < best_loss):
+                        best_loss = loss
+                    if not repeat:
+                        print(f"Auto-repeat pruning: stopping after pass {_pass} — {reason}.")
+                        if getattr(args, "spike_removal", True):
+                            # One more pass, purely to clean up spikes on the
+                            # converged result — everything else is already
+                            # within its limits so the reduction phases exit
+                            # immediately, leaving only the spike pass to do
+                            # real work.
+                            final_spike_pass = True
+                            _pass += 1
+                            continue
+                        break
+                    _pass += 1
 
             _counts_state["value"] = None  # force a fresh read of the final solution
             if cancelled_midway:
@@ -554,6 +708,7 @@ async def start_pruning(settings: PruningSettings):
                 if not svc.complete_prune(
                     prune_job_id, job_id, progress=100.0, phase=None,
                     **_live_counts(), **_pass_fields(),
+                    **({"auto_outcome": auto_result.get("auto_outcome"), "loss": auto_result.get("loss")} if auto else {}),
                 ):
                     # Cancelled in the last moment: the frontend stays on
                     # `job_id`, so it gets its result back as it was.

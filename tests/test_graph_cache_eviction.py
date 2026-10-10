@@ -115,3 +115,50 @@ def test_capture_after_uncaptured_shapes_evicted_the_only_captured_graph():
         torch.testing.assert_close(out, _fn(z))
     torch.randn(4, device="cuda").exponential_()
     torch.cuda.synchronize()
+
+
+def test_a_capture_survives_another_thread_collecting_cyclic_graph_garbage():
+    """Cyclic garbage that holds captured graphs (an old optimizer, a
+    PaletteProxy) is freed by whichever thread runs the collector - the
+    webui's release helpers call gc.collect() from request threads. Resetting
+    a graph while the training thread is capturing is illegal ("operation not
+    permitted when stream is capturing") and invalidated the capture:
+    "operation failed due to a previous error during capture" in training."""
+    import gc
+
+    x = torch.ones(4, 8, device="cuda")
+    stop = threading.Event()
+    errors = []
+
+    def fn(t):
+        return (t * 2.0 + 1.0).sum(dim=0)
+
+    def churn():
+        # Another thread, as a request thread would be: makes graph-holding
+        # cycles and runs the collector, over and over.
+        try:
+            while not stop.is_set():
+                graph = torch.cuda.CUDAGraph()
+                with OH._capture_lock:
+                    with torch.cuda.graph(graph, pool=torch.cuda.graph_pool_handle(), capture_error_mode="thread_local"):
+                        out = x * 3.0
+                cycle = {"graph": graph, "out": out}
+                cycle["self"] = cycle
+                del cycle, graph, out
+                OH.collect_garbage()
+        except Exception as exc:  # pragma: no cover - the failure being guarded
+            errors.append(exc)
+
+    thread = threading.Thread(target=churn)
+    thread.start()
+    try:
+        for _ in range(60):
+            entry = {}
+            with OH.composite_graph_scope():
+                OH._capture(fn, entry, OH._graph_thread_state(), [x], ())
+            entry["graph"].replay()
+            torch.testing.assert_close(entry["output"], fn(x))
+    finally:
+        stop.set()
+        thread.join()
+    assert not errors, errors
