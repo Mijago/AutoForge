@@ -356,9 +356,10 @@ export const PruningModal: React.FC = () => {
               {mode === 'auto' ? (
                 <div className="space-y-3" data-testid="pruning-auto-form">
                   <p className="text-[11px] text-gray-300">
-                    Choose how close to your image the result has to stay. It first tries halving the colors, swaps and
-                    layers, then homes in on the most it can remove while staying within that quality — a handful of
-                    passes, with the result shown after each one. The last pass within the limit is kept.
+                    Choose how close to your image the result has to stay. It first reduces the colors, swaps and
+                    layers together; near that quality it tunes each one on its own, so the ones that cost little
+                    (often layers) go further than the ones that cost a lot. Each pass shows its result, and the
+                    last pass within the limit is kept.
                   </p>
                   <div className="grid grid-cols-2 gap-2" role="radiogroup" aria-label="Quality to keep">
                     {AUTO_PRUNE_PRESETS.map((preset) => (

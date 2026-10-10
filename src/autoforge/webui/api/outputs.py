@@ -291,7 +291,8 @@ def _edited_replacements(job_id: str, job_dir: str, project: dict[str, Any] | No
     project's colorSliders) - not the optimizer's, which name the colours
     the user replaced. If the result is no longer live (pruned since, or a
     server restart), those two can't be regenerated and are left out rather
-    than shipped stale."""
+    than shipped stale - a result the server no longer holds is rebuilt from
+    its saved solution first."""
     edited_png = os.path.join(job_dir, EDITED_PNG)
     if not os.path.exists(edited_png):
         return {}
@@ -302,9 +303,9 @@ def _edited_replacements(job_id: str, job_dir: str, project: dict[str, Any] | No
     replace["swap_instructions.txt"] = None
     replace["project_file.hfp"] = None
     sliders = (project or {}).get("colorSliders")
-    result = get_optimization_service().get_pipeline_result(job_id)
-    if sliders and result:
+    if sliders:
         from ..helpers.edited_export import write_edited_outputs
+        from ..helpers.result_store import ResultUnavailable, using_result
         from ..services.filament_service import get_filament_service
 
         filaments = {f.uuid: f.model_dump() for f in get_filament_service().list()}
@@ -316,9 +317,16 @@ def _edited_replacements(job_id: str, job_dir: str, project: dict[str, Any] | No
             # with it on, settings.background_color is not the base the run used.
             settings = (project or {}).get("settings") or {}
             edited_base = None if settings.get("auto_background_color", True) else settings.get("background_color")
-            replace.update(write_edited_outputs(
-                result, sliders, filaments, edit_dir, background_color=edited_base,
-            ))
+            live = get_optimization_service().get_pipeline_result(job_id)
+            if live:
+                replace.update(write_edited_outputs(live, sliders, filaments, edit_dir, background_color=edited_base))
+            else:
+                with using_result(job_id) as result:
+                    replace.update(write_edited_outputs(
+                        result, sliders, filaments, edit_dir, background_color=edited_base,
+                    ))
+        except ResultUnavailable:
+            pass
         except Exception:
             logging.getLogger(__name__).exception("Could not regenerate the edited instructions for %s", job_id)
     return replace

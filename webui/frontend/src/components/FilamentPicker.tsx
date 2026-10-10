@@ -36,6 +36,7 @@ export const FilamentPicker: React.FC<FilamentPickerProps> = ({ value, onChange,
   const [library, setLibrary] = useState<Filament[] | null>(null)
   const [highlight, setHighlight] = useState(0)
   const [position, setPosition] = useState<{ left: number; top: number; maxHeight: number } | null>(null)
+  const [container, setContainer] = useState<HTMLElement | null>(null)
   const triggerRef = useRef<HTMLButtonElement>(null)
   const popupRef = useRef<HTMLDivElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
@@ -69,15 +70,30 @@ export const FilamentPicker: React.FC<FilamentPickerProps> = ({ value, onChange,
   }, [activeFilaments, library, query])
   const options = useMemo(() => [...active, ...others], [active, others])
 
+  /** Inside a modal dialog (the settings), the popup has to live in the
+   * dialog: a modal makes everything outside it inert (no pointer events,
+   * focus pulled back), so a popup on document.body let every click fall
+   * through, which closed it without picking anything. */
+  const portalTarget = (): HTMLElement => (triggerRef.current?.closest('[role="dialog"]') as HTMLElement | null) ?? document.body
+
   const place = () => {
     const rect = triggerRef.current?.getBoundingClientRect()
     if (!rect) return
+    const target = portalTarget()
+    // The dialog is transformed (centered with translate), which makes it
+    // the containing block of a `fixed` popup: position relative to it.
+    const origin = target === document.body ? { left: 0, top: 0 } : target.getBoundingClientRect()
     const below = window.innerHeight - rect.bottom - 8
     const above = rect.top - 8
     const openUp = below < 200 && above > below
     const maxHeight = Math.min(POPUP_MAX_HEIGHT, openUp ? above : below)
     const left = Math.max(8, Math.min(rect.left, window.innerWidth - POPUP_WIDTH - 8))
-    setPosition({ left, top: openUp ? rect.top - maxHeight - 4 : rect.bottom + 4, maxHeight })
+    setContainer(target)
+    setPosition({
+      left: left - origin.left - (target.clientLeft || 0),
+      top: (openUp ? rect.top - maxHeight - 4 : rect.bottom + 4) - origin.top - (target.clientTop || 0),
+      maxHeight,
+    })
   }
 
   useLayoutEffect(() => {
@@ -178,7 +194,7 @@ export const FilamentPicker: React.FC<FilamentPickerProps> = ({ value, onChange,
         <ChevronDown className="w-3 h-3 text-gray-400 flex-shrink-0" />
       </button>
 
-      {open && position &&
+      {open && position && container &&
         createPortal(
           <div
             ref={popupRef}
@@ -212,7 +228,7 @@ export const FilamentPicker: React.FC<FilamentPickerProps> = ({ value, onChange,
               )}
             </div>
           </div>,
-          document.body,
+          container,
         )}
     </>
   )

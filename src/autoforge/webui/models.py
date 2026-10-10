@@ -242,6 +242,14 @@ class PruningSettings(CamelCaseModel):
     seed_search_count: int = Field(200, ge=1, le=20000)
     fine_tune_height: bool = False
     fine_tune_steps: int = Field(50, ge=1, le=2000)
+    # Pruning the auto-preview ("__init__" as job_id) — a loaded project, or
+    # an image colored by hand: its heightmap plus these color layers make
+    # the result to prune.
+    settings: Optional[OptimizationSettings] = None
+    sliders: list[dict[str, Any]] = Field(default_factory=list)
+    active_filaments: list[dict[str, Any]] = Field(default_factory=list)
+    background_color: Optional[str] = None
+    base: Optional[dict[str, Any]] = None
 
     @model_validator(mode="after")
     def _auto_needs_target(self):

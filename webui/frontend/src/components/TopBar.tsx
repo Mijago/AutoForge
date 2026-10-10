@@ -25,6 +25,7 @@ import { FileMenu } from './FileMenu'
 import { createProgressTracker, formatDuration, type ProgressTracker } from '../lib/progress'
 import { getWorkflowSteps, type WorkflowStep } from '../lib/workflow'
 import { staleReasons } from '../lib/staleResult'
+import { pruneSource } from '../lib/jobTracking'
 import { settingName } from '../lib/history'
 import { sparklinePath } from '../lib/lossHistory'
 import { hasUnsavedChanges } from '../lib/project'
@@ -419,6 +420,7 @@ export const TopBar: React.FC = () => {
   const activeFilaments = useAppStore((s) => s.activeFilaments)
   const inputImage = useAppStore((s) => s.inputImage)
   const initStatus = useAppStore((s) => s.initState.status)
+  const colorSliders = useAppStore((s) => s.colorSliders)
   const settings = useAppStore((s) => s.settings)
   const runInputsByJob = useAppStore((s) => s.runInputsByJob)
   const pushToast = useAppStore((s) => s.pushToast)
@@ -480,7 +482,9 @@ export const TopBar: React.FC = () => {
       : previewBuilding
         ? 'Preparing the preview…'
         : ''
-  const canPrune = hasResult
+  // Also the auto-preview with color layers: a loaded project, or an image
+  // colored by hand, can be pruned without running the optimizer first.
+  const canPrune = pruneSource(currentJob, initStatus, colorSliders) !== null
 
   const jobId = currentJob?.job_id
   const isActive = currentJob?.status === 'running' || currentJob?.status === 'paused' || currentJob?.status === 'pending'
@@ -714,7 +718,7 @@ export const TopBar: React.FC = () => {
         <button
           onClick={() => setPruningModalOpen(true)}
           disabled={!canPrune}
-          title={canPrune ? 'Reduce colors, swaps and layers of this result' : 'Run an optimization first'}
+          title={canPrune ? 'Reduce colors, swaps and layers of this result' : 'Run an optimization, or assign filaments to the color layers, first'}
           className={outlineButton('border-purple-600 text-purple-500 hover:bg-purple-600/15')}
           data-testid="top-pruning-btn"
         >

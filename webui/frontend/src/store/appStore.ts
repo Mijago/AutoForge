@@ -1,6 +1,6 @@
 import { downloadBlob, releaseReplacedObjectUrl } from '../lib/download'
 import { addMissingFilaments, filamentLabel } from '../lib/projectLoad'
-import { acceptsStatusFor, adoptsPrunedResult, finishedResultCounts, isFailureTransition, pruningPollStep } from '../lib/jobTracking'
+import { acceptsStatusFor, adoptsPrunedResult, finishedResultCounts, isFailureTransition, pruneSource, pruningPollStep } from '../lib/jobTracking'
 import { create } from 'zustand'
 import type { Filament, ColorSliderConfig, OptimizationSettings, JobStatus, ProjectState, PruningSettings, InitState, Snapshot } from '../types'
 import { jobStatusFromControlResponse } from '../lib/jobControl'
@@ -729,7 +729,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     // The server still holds the previous image's auto-preview (mesh file,
     // "ready" status and its optimizer's GPU memory); without this the 3D
     // panel would serve that mesh again the moment a new image is added.
-    fetch('/api/init/reset', { method: 'POST' }).catch(() => {})
+    fetch('/api/init/reset?forget=true', { method: 'POST' }).catch(() => {})
     queueCaptureSnapshot('Started a new project')
   },
   setProjectName: (name) => {
@@ -1128,7 +1128,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     // Before the store changes, not after: setting `inputImage` is what makes
     // useAutoPreviewInit start the new heightmap init, and a reset landing
     // after that had started would wipe the init it had just kicked off.
-    await fetch('/api/init/reset', { method: 'POST' }).catch(() => {})
+    await fetch('/api/init/reset?forget=true', { method: 'POST' }).catch(() => {})
     // The focus-area mask was painted over the old picture's shapes.
     const settings = { ...get().settings, input_image: filename, priority_mask: '' }
     // The previous upload's local preview holds that whole file in memory.
@@ -1300,14 +1300,30 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   startPruning: async (overrides) => {
     const state = get()
-    if (state.currentJob?.status !== 'completed') {
+    const source = pruneSource(state.currentJob, state.initState.status, state.colorSliders)
+    if (!source) {
       throw new Error("Run an optimization first — there's no result to prune yet.")
     }
     const pruningSettings = { ...state.pruningSettings, ...overrides }
+    // Without a result on screen, the auto-preview is pruned: its heightmap
+    // with these color layers (a loaded project, or an image colored by hand).
+    const fromPreview = source !== state.currentJob?.job_id
     const response = await fetch('/api/pruning/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...pruningSettings, job_id: state.currentJob.job_id }),
+      body: JSON.stringify({
+        ...pruningSettings,
+        job_id: source,
+        ...(fromPreview
+          ? {
+              settings: state.settings,
+              sliders: state.colorSliders,
+              active_filaments: state.activeFilaments,
+              background_color: effectiveBaseColor(state.settings, state.resolvedBase),
+              base: state.resolvedBase,
+            }
+          : {}),
+      }),
     })
     if (!response.ok) {
       throw new Error(describeApiError(await response.json().catch(() => null), response.status))
@@ -1325,7 +1341,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     // files stop changing once this prune begins, so anything still
     // pointing at it would keep showing the *pre-this-prune* result.
     const jobId = data.job_id
-    const sourceJobId = state.currentJob.job_id
+    const sourceJobId = source
+    const imageAtStart = state.settings.input_image
     stopPruningPoll()
     const generation = pruningPollGeneration
     let networkErrors = 0
@@ -1350,7 +1367,10 @@ export const useAppStore = create<AppState>((set, get) => ({
           // Only while the result the prune started from is still on
           // screen: an undo or a History jump meanwhile moved the user to
           // another step, which this prune must not replace.
-          if (job.status === 'completed' && adoptsPrunedResult(get().currentJob?.job_id, sourceJobId)) {
+          if (
+            job.status === 'completed' &&
+            adoptsPrunedResult(get().currentJob?.job_id, sourceJobId, { now: get().settings.input_image, atStart: imageAtStart })
+          ) {
             // The pruned result is built from the same run's settings and
             // filaments. Without its own entry here it had none, so the
             // "Out of date" badge could never show for a pruned result.
@@ -1664,7 +1684,7 @@ async function applyProjectFile(parsed: ParsedProjectFile, savedHeightmap: Saved
     // in place is what showed the previous project's PLY under the loaded
     // one, and re-rendered the new project's colors onto the old heightmap.
     stopPruningPoll()
-    await fetch('/api/init/reset', { method: 'POST' }).catch(() => {})
+    await fetch('/api/init/reset?forget=true', { method: 'POST' }).catch(() => {})
     useAppStore.setState({
       currentJob: null,
       stlFile: null,

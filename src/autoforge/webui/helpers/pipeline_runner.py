@@ -119,6 +119,7 @@ def build_pipeline_state(
     settings: dict,
     device: Optional[torch.device] = None,
     init_progress: Optional[Callable] = None,
+    heightmap_init: Optional[Callable] = None,
 ) -> Dict[str, Any]:
     """Everything ``run_pipeline()`` does up to (and including) building the
     ``FilamentOptimizer`` — material/image loading, background selection,
@@ -144,6 +145,11 @@ def build_pipeline_state(
         Directory for output artifacts (created if missing).
     settings :
         Arbitrary settings dict merged over defaults (see ``_DEFAULTS``).
+    heightmap_init :
+        ``heightmap_init(output_img_np) -> (pixel_height_logits_init,
+        global_logits_init, pixel_height_labels)`` replaces the heightmap
+        initialization — a result rebuilt from its saved heightmap (see
+        helpers/result_store.py) already has its heights.
     device :
         Torch device.  When ``None``, auto-detected via ``get_device()``
         (CUDA/ROCm, then Apple Metal, then CPU), honoring a ``device`` entry
@@ -244,16 +250,19 @@ def build_pipeline_state(
     focus_map_full = _load_priority_mask(args, output_img_np, device)
 
     # --- Heightmap initialisation ---
-    pixel_height_logits_init, global_logits_init, pixel_height_labels = (
-        _initialize_heightmap(
-            args,
-            output_img_np,
-            bg_rgb,
-            material_colors_np,
-            random_seed,
-            progress=init_progress,
+    if heightmap_init is not None:
+        pixel_height_logits_init, global_logits_init, pixel_height_labels = heightmap_init(output_img_np)
+    else:
+        pixel_height_logits_init, global_logits_init, pixel_height_labels = (
+            _initialize_heightmap(
+                args,
+                output_img_np,
+                bg_rgb,
+                material_colors_np,
+                random_seed,
+                progress=init_progress,
+            )
         )
-    )
 
     # Apply alpha mask to full-res logits
     if alpha is not None:

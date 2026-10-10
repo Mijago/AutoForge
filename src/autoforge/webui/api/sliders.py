@@ -7,9 +7,21 @@ from ..helpers.sliders import (
     derive_sliders_from_result,
     derive_layer_range_from_result,
 )
+from ..helpers.result_store import ResultUnavailable, using_result
 from .init import get_init_pipeline_result
 
 router = APIRouter()
+
+
+def _from_result(job_id: str, derive):
+    """``derive(result)`` for the job's result — rebuilt from its saved
+    solution if need be — or None when there is none. Blocking (a rebuild
+    runs on the GPU)."""
+    try:
+        with using_result(job_id) as result:
+            return derive(result)
+    except ResultUnavailable:
+        return None
 
 _DEFAULTS = {"sliders": [], "min_layer": 0, "max_layer": 75}
 
@@ -51,9 +63,7 @@ def _sliders_from_optimizer(job_id: str | None = None):
     if job_id:
         job = svc.get_job(job_id)
         if job and job.status == "completed":
-            result = svc.get_pipeline_result(job.job_id)
-            if result:
-                return derive_sliders_from_result(result) or _DEFAULTS
+            return _from_result(job.job_id, derive_sliders_from_result) or _DEFAULTS
         return _DEFAULTS
 
     for job in svc.get_history():
@@ -96,9 +106,9 @@ async def get_base_color(job_id: str | None = None):
     if job_id:
         job = svc.get_job(job_id)
         if job and job.status == "completed":
-            result = svc.get_pipeline_result(job.job_id)
-            if result:
-                return {"base": derive_base_from_result(result), "source": job.job_id}
+            base = await asyncio.to_thread(_from_result, job.job_id, derive_base_from_result)
+            if base:
+                return {"base": base, "source": job.job_id}
         return {"base": None, "source": None}
 
     for job in svc.get_history():

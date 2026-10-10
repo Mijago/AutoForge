@@ -44,31 +44,87 @@ def test_first_pass_tries_the_middle_of_the_range():
     assert limits == {"colors": 5, "swaps": 10, "layers": 20}
 
 
-def test_a_good_pass_halves_what_is_left_and_a_bad_one_goes_back_up():
-    search = _search({"colors": 8, "swaps": 8, "layers": 8})
+def test_a_good_pass_halves_what_is_left_far_from_the_target():
+    search = _search({"colors": 8, "swaps": 8, "layers": 8}, target=30.0)
     search.propose(search.start)
     first = search._level
-    search.accept()
+    search.accept(5.0)  # far under the target: keep going together
+    assert search.phase == "coarse"
     search.propose(search.limits_at(first))
-    second = search._level
-    assert second > first  # good: keep going down
-    search.reject()
-    search.propose(search.limits_at(first))
-    assert first < search._level < second  # bad: between the two
+    assert search._level > first
 
 
-def test_finds_the_exact_edge_in_logarithmically_many_passes():
-    # Anything down to 7 colors / 14 swaps / 27 layers is fine, no further.
-    edge = {"colors": 7, "swaps": 14, "layers": 27}
-    search = _search()
-    tried = _run(search, edge)
+def test_a_bad_pass_or_a_near_one_switches_to_tuning_each_count():
+    search = _search(target=30.0)
+    search.propose(search.start)
+    search.accept(25.0)  # 25 >= 0.75 * 30
+    assert search.phase == "fine"
+
+    search = _search(target=30.0)
+    search.propose(search.start)
+    search.reject(35.0)
+    assert search.phase == "fine"
+    # From the last good result (the start), one count at a time.
+    limits = search.propose(search.start)
+    changed = [k for k in limits if limits[k] != search.start[k]]
+    assert len(changed) == 1
+
+
+def _cost_run(search, cost, target, counts=None):
+    """Drive a search with a loss of ``cost(limits)``. Returns (limits
+    tried, last good counts)."""
+    counts = dict(counts or search.start)
+    tried = []
+    while (limits := search.propose(counts)) is not None:
+        tried.append(limits)
+        loss = cost(limits)
+        if loss <= target:
+            counts = dict(limits)
+            search.accept(loss)
+        else:
+            search.reject(loss)
+    return tried, counts
+
+
+def test_cheap_counts_go_further_than_the_expensive_one():
+    """Colors are expensive, layers almost free: scaled together, the layers
+    stopped where the colors ran out of budget."""
+    start = {"colors": 10, "swaps": 20, "layers": 40}
+
+    def cost(c):
+        return 3.0 * (10 - c["colors"]) + 0.2 * (20 - c["swaps"]) + 0.05 * (40 - c["layers"])
+
+    search = _search(start, target=20.0)
+    tried, good = _cost_run(search, cost, 20.0)
+    assert cost(good) <= 20.0
+    # Joint scaling alone ends near 6 colors / 12 swaps / 24 layers.
+    joint = _search(start)
+    joint_good = max(
+        (joint.limits_at(level) for level in range(joint.n + 1) if cost(joint.limits_at(level)) <= 20.0),
+        key=lambda c: -c["layers"],
+    )
+    assert good["layers"] < joint_good["layers"] - 10
+    # Nothing left on the table: one more of any count goes over.
+    for k in good:
+        if good[k] > search.floor_of(k, good):
+            assert cost({**good, k: good[k] - 1}) > 20.0
     assert search.outcome == "limit_reached"
-    assert len(tried) <= 7  # n = 39 levels
-    best = [t for t in tried if all(t[k] >= edge[k] for k in t)][-1]
-    # The best good level is the one right above the bad one: one level apart.
-    assert search.hi - search.lo == 1
-    assert best == search.limits_at(search.lo)
-    assert not all(search.limits_at(search.hi)[k] >= edge[k] for k in edge)
+    assert len(tried) <= 25
+
+
+def test_a_value_that_went_over_is_never_tried_again():
+    search = _search(target=10.0)
+    tried, _good = _cost_run(search, lambda c: 2.0 * (10 - c["colors"]) + 0.01 * (40 - c["layers"]), 10.0)
+    seen = [tuple(sorted(t.items())) for t in tried]
+    assert len(seen) == len(set(seen))
+
+
+def test_fine_limits_respect_what_the_other_counts_need():
+    search = _search({"colors": 6, "swaps": 10, "layers": 12}, min_layers=3, target=10.0)
+    tried, _good = _cost_run(search, lambda c: 0.5 * (6 - c["colors"]) + 0.5 * (10 - c["swaps"]), 10.0)
+    for t in tried:
+        assert t["swaps"] >= t["colors"] - 1
+        assert t["layers"] >= max(3, t["swaps"])
 
 
 def test_everything_good_ends_at_the_fewest_possible():

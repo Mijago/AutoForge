@@ -54,9 +54,32 @@ export function pruningPollStep(
   return 'continue'
 }
 
+const INIT_JOB_SENTINEL = '__init__'
+
 /** Whether a finished prune may become the current job: only while the
  * result it started from is still the one on screen. Undoing (or jumping in
- * History) during a prune used to be overridden when the prune finished. */
-export function adoptsPrunedResult(currentJobId: string | undefined | null, sourceJobId: string): boolean {
+ * History) during a prune used to be overridden when the prune finished.
+ * A prune of the auto-preview (`__init__`) started with no result on screen,
+ * so it is adopted while there still is none, for the same image. */
+export function adoptsPrunedResult(
+  currentJobId: string | undefined | null,
+  sourceJobId: string,
+  image?: { now: string | null | undefined; atStart: string | null | undefined },
+): boolean {
+  if (sourceJobId === INIT_JOB_SENTINEL) return !currentJobId && (!image || image.now === image.atStart)
   return currentJobId === sourceJobId
+}
+
+/** What a prune starts from: the finished result on screen, else the
+ * auto-preview with the color layers painted onto it (a loaded project, or
+ * an image colored by hand), else nothing. */
+export function pruneSource(
+  currentJob: Pick<JobStatus, 'job_id' | 'status'> | null,
+  initStatus: string,
+  sliders: { enabled: boolean; layer: number; filament_uuid: string }[],
+): string | null {
+  if (currentJob?.status === 'completed') return currentJob.job_id
+  if (currentJob && ['pending', 'running', 'paused'].includes(currentJob.status)) return null
+  if (initStatus !== 'ready') return null
+  return sliders.some((s) => s.enabled && s.layer > 0 && !!s.filament_uuid) ? INIT_JOB_SENTINEL : null
 }

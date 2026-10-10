@@ -11,12 +11,72 @@ from ..models import PruningSettings
 from ..services.optimization_service import get_optimization_service
 from ..helpers.auto_prune import AutoPruneSearch
 from ..helpers.pipeline_runner import friendly_error_message
+from ..helpers.result_store import (
+    ResultUnavailable,
+    rebuild_pipeline_result,
+    register_pipeline_result,
+    resolve_pipeline_result,
+    save_solution,
+    solution_from_sliders,
+)
 from ..helpers.sliders import result_counts_from_optimizer, should_repeat_prune
 from ..helpers.telemetry import capture_exception
 from ..config import config
 from .workers import STILL_STOPPING, running_worker, start_worker, wait_until_idle
 
 router = APIRouter()
+
+# Mirrors api/preview.py's INIT_JOB_SENTINEL: the pre-run auto-preview.
+INIT_JOB_SENTINEL = "__init__"
+
+
+def _init_solution(settings: PruningSettings) -> dict:
+    """The auto-preview's heightmap with the request's color layers, and
+    the image to rebuild it against. Raises HTTPException when it can't be
+    pruned."""
+    import numpy as np
+
+    from ..services.image_service import get_image_service
+    from .init import get_init_pipeline_result
+
+    run_settings = settings.settings
+    if run_settings is None or not run_settings.input_image:
+        raise HTTPException(400, "Upload an input image first.")
+    init_result = get_init_pipeline_result()
+    heights = None
+    if init_result:
+        full_logits = init_result.get("pixel_height_logits_init")
+        if isinstance(full_logits, np.ndarray):
+            # A preview built from the photo trains at the processing
+            # resolution; its heights exist at the output resolution too.
+            from autoforge.Modules.Optimizer import _discretize_height_only
+
+            optimizer = init_result["optimizer"]
+            heights = _discretize_height_only(
+                torch.from_numpy(full_logits.astype(np.float32)), float(optimizer.h), int(optimizer.max_layers),
+            )
+        else:
+            _global, heights = init_result["optimizer"].get_discretized_solution(best=True)
+    if heights is None:
+        raise HTTPException(400, "The preview of the image isn't ready yet. Wait for it, then try again.")
+    image_path = get_image_service().get_path(run_settings.input_image)
+    if image_path is None:
+        raise HTTPException(404, f"Input image not found: {run_settings.input_image}")
+    settings_dict = run_settings.model_dump()
+    mask = settings_dict.get("priority_mask") or ""
+    settings_dict["priority_mask"] = (get_image_service().get_path(mask) or "") if mask else ""
+    try:
+        solution = solution_from_sliders(
+            heights.detach().cpu().numpy().astype(np.int64),
+            settings.sliders,
+            settings.active_filaments,
+            settings_dict,
+            background_color=settings.background_color,
+            base=settings.base,
+        )
+    except ResultUnavailable as e:
+        raise HTTPException(400, str(e))
+    return {"solution": solution, "image_path": image_path}
 
 
 @router.post("/start")
@@ -63,10 +123,19 @@ async def start_pruning(settings: PruningSettings):
     # and also naturally blocks pruning before any optimization has run.
     if not settings.job_id:
         raise HTTPException(400, "Run an optimization first — there's no result to prune yet.")
-    target_job = svc.get_job(settings.job_id)
-    if not target_job or target_job.status != "completed":
-        raise HTTPException(400, "Run an optimization first — there's no completed result to prune yet.")
-    job_id = target_job.job_id
+    # The auto-preview — a loaded project, or an image colored by hand —
+    # prunes from its heightmap and the color layers sent along.
+    from_init = settings.job_id == INIT_JOB_SENTINEL
+    init_solution = None
+    if from_init:
+        init_solution = await asyncio.to_thread(_init_solution, settings)
+        job_inputs = {"input_image": settings.settings.input_image, "flatforge": settings.settings.flatforge}
+    else:
+        target_job = svc.get_job(settings.job_id)
+        if not target_job or target_job.status != "completed":
+            raise HTTPException(400, "Run an optimization first — there's no completed result to prune yet.")
+        job_inputs = {"input_image": target_job.input_image, "flatforge": target_job.flatforge}
+    job_id = settings.job_id
 
     # Create a pruning job via the public API
     import datetime
@@ -82,10 +151,10 @@ async def start_pruning(settings: PruningSettings):
     # populates — omit whichever is None rather than pass it through, which
     # that model rejects.
     prune_job_settings: dict = {"iterations": 1}
-    if target_job.input_image is not None:
-        prune_job_settings["input_image"] = target_job.input_image
-    if target_job.flatforge is not None:
-        prune_job_settings["flatforge"] = target_job.flatforge
+    if job_inputs["input_image"]:
+        prune_job_settings["input_image"] = job_inputs["input_image"]
+    if job_inputs["flatforge"] is not None:
+        prune_job_settings["flatforge"] = job_inputs["flatforge"]
     svc.create_job(prune_job_settings, job_id=prune_job_id)
     cancel_event = svc.cancel_event(prune_job_id)
     pause_event = svc.pause_event(prune_job_id)
@@ -113,7 +182,11 @@ async def start_pruning(settings: PruningSettings):
             optimizer.preview_callback = rollback["preview_callback"]
             optimizer.prune_step_callback = None
         finally:
-            svc.return_pipeline_result(job_id, prune_job_id)
+            if from_init:
+                # Built for this prune only: nothing to hand back.
+                svc.clear_pipeline_result(prune_job_id)
+            else:
+                svc.return_pipeline_result(job_id, prune_job_id)
         broadcast = rollback.get("broadcast")
         if broadcast is not None:
             broadcast()
@@ -124,14 +197,28 @@ async def start_pruning(settings: PruningSettings):
         try:
             svc.update_status(prune_job_id, "running")
 
-            # Take over the optimization job's pipeline result: pruning
-            # mutates its optimizer in place, so from here on it no longer
-            # holds `job_id`'s solution (see get_pipeline_result).
-            pipeline_result = svc.claim_pipeline_result(prune_job_id, job_id)
+            if from_init:
+                svc.update_status(prune_job_id, "running", phase="Preparing")
+                pipeline_result = rebuild_pipeline_result(
+                    init_solution["solution"], init_solution["image_path"],
+                    os.path.join(config.checkpoints_path, prune_job_id),
+                )
+                register_pipeline_result(prune_job_id, pipeline_result)
+            else:
+                # The server only keeps the newest result, and none across a
+                # restart: bring this one back from its saved solution.
+                try:
+                    resolve_pipeline_result(job_id, allow_while_job=prune_job_id)
+                except ResultUnavailable as e:
+                    svc.update_status(prune_job_id, "failed", error=str(e))
+                    return
+                # Take over the optimization job's pipeline result: pruning
+                # mutates its optimizer in place, so from here on it no longer
+                # holds `job_id`'s solution (see get_pipeline_result).
+                pipeline_result = svc.claim_pipeline_result(prune_job_id, job_id)
             if not pipeline_result:
                 svc.update_status(prune_job_id, "failed",
-                                  error="No optimization pipeline result found (this result was pruned "
-                                        "since, or the server was restarted). Go to the newest result, "
+                                  error="This result isn't available anymore. Go to the newest result, "
                                         "or run optimization first.")
                 return
             claimed_optimizer = pipeline_result["optimizer"]
@@ -531,7 +618,9 @@ async def start_pruning(settings: PruningSettings):
 
                 outcome: str | None = "start_above_limit"
                 if start <= target:
-                    search = AutoPruneSearch(good_counts, min_layers=int(getattr(args, "min_layers", 1)))
+                    search = AutoPruneSearch(
+                        good_counts, min_layers=int(getattr(args, "min_layers", 1)), target=target,
+                    )
                     while True:
                         if _cancelled_while_waiting():
                             return None, True
@@ -577,10 +666,10 @@ async def start_pruning(settings: PruningSettings):
                         if kept:
                             good = _clone_solution(optimizer.solution_snapshot())
                             good_counts, good_loss = counts, loss
-                            search.accept()
+                            search.accept(loss)
                         else:
                             optimizer.restore_solution_snapshot(_clone_solution(good))
-                            search.reject()
+                            search.reject(loss)
                         _counts_state["value"] = None
                         # The preview between passes: the kept result, or the
                         # one it went back to.
@@ -705,6 +794,12 @@ async def start_pruning(settings: PruningSettings):
                 # alias_pipeline_result for why this must not go through
                 # set_pipeline_result's "release every older result" path.
                 optimizer.prune_step_callback = None
+                # On disk first, so this result outlives the server and can be
+                # brought back once a newer one replaces it in memory.
+                try:
+                    save_solution(output_dir, pipeline_result)
+                except Exception as e:
+                    capture_exception(e, {"phase": "save_solution", "job_id": prune_job_id})
                 if not svc.complete_prune(
                     prune_job_id, job_id, progress=100.0, phase=None,
                     **_live_counts(), **_pass_fields(),

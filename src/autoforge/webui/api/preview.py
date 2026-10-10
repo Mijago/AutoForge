@@ -11,6 +11,7 @@ from ..services.optimization_service import get_optimization_service
 from ..services.filament_service import get_filament_service
 from autoforge.Helper.FilamentHelper import hex_to_rgb
 from ..helpers.mesh_persist import schedule_persist
+from ..helpers.result_store import ResultUnavailable, resolve_pipeline_result, using_result
 from ..helpers.slider_render import (
     compute_slider_render,
     render_with_sliders,
@@ -89,14 +90,12 @@ async def render_preview(data: dict):
         if job is None or job.status != "completed":
             raise HTTPException(400, "No completed optimization result to render")
 
-        pipeline_result = svc.get_pipeline_result(job.job_id)
-        if not pipeline_result:
-            raise HTTPException(
-                409,
-                "This result can't be re-colored anymore: it was pruned since, or the "
-                "server was restarted after it was computed. Go to the newest result, "
-                "or run the optimization again, to edit its colors.",
-            )
+        # Rebuilt from its saved solution when the server doesn't hold it
+        # anymore (pruned since, replaced by a newer result, a restart).
+        try:
+            pipeline_result = await asyncio.to_thread(resolve_pipeline_result, job.job_id)
+        except ResultUnavailable as e:
+            raise HTTPException(409, str(e))
         effective_job_id = job.job_id
         output_dir = os.path.join(config.checkpoints_path, job.job_id)
         file_names = {"png_name": EDITED_PNG, "ply_name": EDITED_PLY}
@@ -132,27 +131,36 @@ async def render_preview(data: dict):
         with render_lock:
             if _latest_seq.get(effective_job_id) != seq:
                 return "superseded"
-            if not want_vertex_colors:
-                return render_with_sliders(
-                    pipeline_result, sliders, filament_lookup, output_dir,
-                    background_rgb=background_rgb, **file_names,
-                )
-            render = compute_slider_render(pipeline_result, sliders, filament_lookup, background_rgb=background_rgb)
-            if render is None:
-                return None
-            png_name = file_names.get("png_name", "final_model.png")
-            ply_name = file_names.get("ply_name", "final_model_colored.ply")
-            write_slider_png(render, output_dir, png_name)
-            schedule_persist(effective_job_id, lambda: write_slider_ply(render, output_dir, ply_name))
-            return {
-                "image_b64": render["image_b64"],
-                "vertex_colors": base64.b64encode(top_vertex_colors(render)).decode("ascii"),
-                "top_vertex_count": int(len(render["top_vertex_pixels"])),
-            }
+            if effective_job_id == INIT_JOB_SENTINEL:
+                return _render_with(pipeline_result)
+            with using_result(effective_job_id) as live_result:
+                return _render_with(live_result)
+
+    def _render_with(pipeline_result):
+        if not want_vertex_colors:
+            return render_with_sliders(
+                pipeline_result, sliders, filament_lookup, output_dir,
+                background_rgb=background_rgb, **file_names,
+            )
+        render = compute_slider_render(pipeline_result, sliders, filament_lookup, background_rgb=background_rgb)
+        if render is None:
+            return None
+        png_name = file_names.get("png_name", "final_model.png")
+        ply_name = file_names.get("ply_name", "final_model_colored.ply")
+        write_slider_png(render, output_dir, png_name)
+        schedule_persist(effective_job_id, lambda: write_slider_ply(render, output_dir, ply_name))
+        return {
+            "image_b64": render["image_b64"],
+            "vertex_colors": base64.b64encode(top_vertex_colors(render)).decode("ascii"),
+            "top_vertex_count": int(len(render["top_vertex_pixels"])),
+        }
 
     # Off the event loop: this is real GPU/CPU work, and running it inline
     # stalled every other request and websocket while a slider was dragged.
-    result = await asyncio.to_thread(_render)
+    try:
+        result = await asyncio.to_thread(_render)
+    except ResultUnavailable as e:
+        raise HTTPException(409, str(e))
     if result == "superseded":
         return {"status": "superseded", "job_id": effective_job_id}
     if result is None:

@@ -19,6 +19,7 @@ from ..services.optimization_service import get_optimization_service
 from ..services.project_service import atomic_write_json
 from ..helpers.colored_mesh import generate_colored_preview_mesh
 from ..helpers.project_heightmap import encode_heightmap, restored_pipeline_result
+from ..helpers.result_store import ResultUnavailable, using_result
 from ..helpers.slider_render import compute_slider_render, write_slider_ply
 from ..helpers.sliders import derive_base_from_result, derive_layer_range_from_result
 from .init import (
@@ -77,16 +78,22 @@ async def get_heightmap(job_id: str):
     a project file to carry — see helpers/project_heightmap.py."""
     if job_id == INIT_JOB_SENTINEL:
         result = get_init_pipeline_result()
+        if not result:
+            raise HTTPException(404, "The preview of the image isn't ready; the project is saved without its heightmap.")
+        encoded = await asyncio.to_thread(encode_heightmap, result)
     else:
         job = get_optimization_service().get_job(job_id)
-        result = get_optimization_service().get_pipeline_result(job_id) if job and job.status == "completed" else None
-    if not result:
-        raise HTTPException(
-            404,
-            "This result's heightmap isn't available anymore (the server was restarted "
-            "since it was computed); the project is saved without it.",
-        )
-    encoded = await asyncio.to_thread(encode_heightmap, result)
+        if not job or job.status != "completed":
+            raise HTTPException(404, "There's no finished result to take the heightmap from.")
+
+        def _encode():
+            with using_result(job_id) as result:
+                return encode_heightmap(result)
+
+        try:
+            encoded = await asyncio.to_thread(_encode)
+        except ResultUnavailable as e:
+            raise HTTPException(404, f"{e} The project is saved without its heightmap.")
     if encoded is None:
         raise HTTPException(404, "This result has no heightmap yet.")
     return encoded
@@ -140,10 +147,47 @@ def _write_restored_mesh(result: dict, body: RestoreHeightmapRequest, background
     os.replace(tmp, init_mesh_path())
 
 
+def _saved_restore_file() -> str:
+    # Not under _init/: resetting the auto-preview clears that directory's mesh.
+    return os.path.join(config.checkpoints_path, "_project", "restored_heightmap.json")
+
+
+def forget_saved_heightmap() -> None:
+    try:
+        os.remove(_saved_restore_file())
+    except OSError:
+        pass
+
+
+async def restore_saved_heightmap(input_image: str) -> Optional[dict]:
+    """A loaded project's heightmap, shown again for its image.
+
+    It can't be rebuilt from the photo — it came with the project file — so
+    without this a server restart (or a run, which releases the preview)
+    turned the loaded project back into a fresh auto-preview of the photo.
+    None when the last loaded project wasn't for ``input_image``."""
+    path = _saved_restore_file()
+    if not input_image or not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            body = RestoreHeightmapRequest(**json.load(f))
+    except (OSError, ValueError, TypeError):
+        forget_saved_heightmap()
+        return None
+    if body.settings.input_image != input_image or get_image_service().get_path(input_image) is None:
+        return None
+    return await _restore(body, remember=False)
+
+
 @router.post("/heightmap")
 async def restore_heightmap(body: RestoreHeightmapRequest):
     """Show a loaded project's saved heightmap as the auto-preview, instead
     of building a new one from the photo."""
+    return await _restore(body, remember=True)
+
+
+async def _restore(body: RestoreHeightmapRequest, remember: bool) -> dict:
     if is_init_building():
         raise HTTPException(400, "Already initializing")
     if get_optimization_service().get_any_active_job() is not None:
@@ -170,4 +214,8 @@ async def restore_heightmap(body: RestoreHeightmapRequest):
         raise HTTPException(400, f"Could not restore the project's heightmap: {e}")
     if not install_init_result(result, range_info, base, generation):
         raise HTTPException(409, "Auto-preview was reset while the project was being loaded.")
+    if remember:
+        path = _saved_restore_file()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        atomic_write_json(path, body.model_dump())
     return {"status": "ready", **range_info, "base": base}

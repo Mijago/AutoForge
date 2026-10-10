@@ -343,6 +343,16 @@ async def start_optimization(settings: OptimizationSettings):
                 svc.update_status(job.job_id, "failed", error=friendly_error_message(exc))
                 return
 
+            # The solution on disk, so the result can be pruned and re-colored
+            # after a restart or once a newer result replaced it in memory.
+            try:
+                from ..helpers.result_store import save_solution
+
+                save_solution(output_dir, result)
+            except Exception as exc:
+                logger.exception("Could not save the solution of job %s", job.job_id)
+                capture_exception(exc, {"phase": "save_solution", "job_id": job.job_id})
+
             # Before "completed", so the snapshot taken on completion holds
             # the result's own stack rather than the last training preview.
             _broadcast_final_result(result, job.job_id)

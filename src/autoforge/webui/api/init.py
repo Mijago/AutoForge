@@ -147,6 +147,15 @@ def _run_init_sync(input_image_path: str, filament_dicts: list[dict], settings_d
 async def run_init(settings: OptimizationSettings):
     global _state, _pipeline_result, _in_flight, _generation
 
+    # A loaded project's own heightmap, if this is its image (see
+    # project.restore_saved_heightmap) — after a restart, or a run that
+    # released the preview, it must come back rather than one from the photo.
+    from .project import restore_saved_heightmap
+
+    restored = await restore_saved_heightmap(settings.input_image or "")
+    if restored is not None:
+        return {"preview_image": None, **restored}
+
     with _lock:
         if _state["status"] == "initializing":
             # A build is in flight. The reset that replaced it (if any)
@@ -339,7 +348,7 @@ async def init_mesh():
 
 
 @router.post("/reset")
-async def reset_init():
+async def reset_init(forget: bool = False):
     """Forget the current auto-preview.
 
     Uploading a different image used to leave this state at "ready" with the
@@ -349,12 +358,21 @@ async def reset_init():
     the panel shows "building the preview" instead of something wrong, and
     the old optimizer's device memory is handed back at the same time.
 
+    ``forget`` also drops a loaded project's saved heightmap (a new upload,
+    a new project); a History jump keeps it.
+
     If a build is still in flight, this waits for it to finish: the
     replacement build must not run on the GPU next to it (that's what OOM'd
     when switching images), and the replaced build's result must be released
     before the reset is complete.
     """
     global _state
+    if forget:
+        # A new image or project: a loaded project's heightmap no longer
+        # belongs to what is on screen, even for the same photo.
+        from .project import forget_saved_heightmap
+
+        forget_saved_heightmap()
     in_flight_event = reset_init_state()
     # A slider-edit mesh of the replaced image still being written must land
     # before the new image's preview is built, never after it.
