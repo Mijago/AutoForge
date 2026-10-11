@@ -802,10 +802,16 @@ class FilamentOptimizer:
         if scale < 1.0:
             size = (max(8, round(H * scale)), max(8, round(W * scale)))
             eff_small = F.interpolate(eff_logits[None, None], size=size, mode="nearest")[0, 0]
+            # "area" is adaptive_avg_pool2d, which MPS only supports for
+            # divisible sizes; do this one-off resize on the CPU there.
+            target = saved[0].permute(2, 0, 1)[None].float()
+            if target.device.type == "mps":
+                target = target.cpu()
             self.target = (
-                F.interpolate(saved[0].permute(2, 0, 1)[None].float(), size=size, mode="area")[0]
+                F.interpolate(target, size=size, mode="area")[0]
                 .permute(1, 2, 0)
                 .contiguous()
+                .to(saved[0].device)
             )
             if saved[1] is not None:
                 self.focus_map = F.interpolate(saved[1][None, None].float(), size=size, mode="bilinear")[0, 0]
