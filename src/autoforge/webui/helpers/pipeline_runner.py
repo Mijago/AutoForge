@@ -31,6 +31,8 @@ from autoforge.auto_forge import (
     _prepare_background_and_materials,
     _compute_pixel_sizes,
     _load_priority_mask,
+    attach_height_guidance,
+    guidance_init_target,
     _initialize_heightmap,
     _prepare_processing_targets,
     _build_optimizer,
@@ -93,6 +95,59 @@ def run_limit_args(ns: argparse.Namespace) -> None:
     ns.constrained_opt = True
     ns.pruning_max_colors = int(max_colors) if max_colors is not None else 100
     ns.pruning_max_swaps = int(max_swaps) if max_swaps is not None else 100
+
+
+# The height guidance a webui run uses when the user asked for none: the
+# photo's depth at strength 1. Starting from a depth-ordered stack and
+# following the depth gently prints the colours better than the colour-only
+# run (about -8% colour loss over the guidance benchmark,
+# benchmarks/guidance_loop_harness.py) - so it runs in the background,
+# never shown, saved into the user's settings or reported.
+DEFAULT_HEIGHT_GUIDANCE = {"strength": 1.0, "depth": True}
+
+
+def _user_guidance_empty(args) -> bool:
+    """True when the run's own height guidance asks for nothing (no depth,
+    pins, colour picks, painted regions or order) - then the default
+    applies. Any setting of the user's replaces it, a strength of 0 too."""
+    import json
+
+    if getattr(args, "height_regions", "") or "":
+        return False
+    raw = getattr(args, "height_guidance", None)
+    if raw is None or raw == "":
+        return True
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return False
+    if not isinstance(raw, dict):
+        return False
+    # What the user asked for, not what resolves (a pin's filament may only
+    # be known by its uuid here).
+    asks = (
+        bool(raw.get("depth")) or bool(raw.get("pins")) or bool(raw.get("colors"))
+        or (raw.get("order") or "auto") != "auto"
+    )
+    return not asks
+
+
+def _guidance_args(args) -> Tuple[Any, bool]:
+    """``(args for the height guidance, hidden)``: ``args`` itself, or - for
+    a webui run (``default_height_guidance``) whose user asked for no
+    guidance and with the depth model available - a copy carrying
+    DEFAULT_HEIGHT_GUIDANCE (``args`` stays as the user set it)."""
+    if not getattr(args, "default_height_guidance", False) or not _user_guidance_empty(args):
+        return args, False
+    import importlib.util
+
+    if importlib.util.find_spec("transformers") is None:
+        return args, False
+    g_args = argparse.Namespace(**vars(args))
+    g_args.height_guidance = dict(DEFAULT_HEIGHT_GUIDANCE)
+    g_args.height_regions = ""
+    return g_args, True
 
 
 def _make_settings(overrides: dict) -> argparse.Namespace:
@@ -249,6 +304,20 @@ def build_pipeline_state(
     # --- Priority mask (full-res) ---
     focus_map_full = _load_priority_mask(args, output_img_np, device)
 
+    # --- Height guidance (the user's, or the hidden default) ---
+    g_args, hidden_guidance = _guidance_args(args)
+    init_target = None
+    if heightmap_init is None:
+        try:
+            init_target = guidance_init_target(g_args, output_img_np, alpha)
+        except Exception:
+            if not hidden_guidance:
+                raise
+            # The default is a background extra: without a working depth
+            # model the run goes on unguided.
+            traceback.print_exc()
+            g_args, hidden_guidance = args, False
+
     # --- Heightmap initialisation ---
     if heightmap_init is not None:
         pixel_height_logits_init, global_logits_init, pixel_height_labels = heightmap_init(output_img_np)
@@ -261,6 +330,7 @@ def build_pipeline_state(
                 material_colors_np,
                 random_seed,
                 progress=init_progress,
+                height_target=init_target,
             )
         )
 
@@ -305,6 +375,18 @@ def build_pipeline_state(
         focus_map_proc,
         alpha_proc=alpha_proc,
     )
+    try:
+        attach_height_guidance(
+            optimizer, g_args, output_img_np, alpha,
+            material_names=material_names, material_uuids=material_uuids, material_colors_hex=colors_list,
+        )
+    except Exception:
+        if not hidden_guidance:
+            raise
+        traceback.print_exc()
+        optimizer.guidance = None
+    if hidden_guidance and optimizer.guidance is not None:
+        optimizer.guidance.hidden = True
 
     # --- Return everything for later export / inspection ---
     return {
@@ -372,6 +454,10 @@ def run_pipeline(
     """
     report = phase_callback or (lambda phase, fraction: None)
     report("Estimating heights", 0.0)
+    # Optimization runs get the hidden default height guidance (see
+    # DEFAULT_HEIGHT_GUIDANCE); saved with the result, so a restored result
+    # prunes as it was optimized.
+    settings = {**settings, "default_height_guidance": settings.get("default_height_guidance", True)}
     state = build_pipeline_state(
         input_image_path, active_filaments, output_dir, settings, device=device,
         init_progress=lambda f: report("Estimating heights", f),

@@ -136,6 +136,10 @@ async def start_optimization(settings: OptimizationSettings):
     if running_worker() is not None and await asyncio.to_thread(wait_until_idle, 2.0) is not None:
         raise HTTPException(409, STILL_STOPPING)
 
+    from ..helpers.guidance_views import QUICK_PREVIEW_BUSY, quick_preview_running
+
+    if quick_preview_running():
+        raise HTTPException(409, QUICK_PREVIEW_BUSY)
     busy = svc.get_any_active_job()
     if busy is not None:
         if busy.job_id.startswith("prune-"):
@@ -212,6 +216,16 @@ async def start_optimization(settings: OptimizationSettings):
                     svc.update_status(job.job_id, "failed", error=err)
                     return
                 run_settings["priority_mask"] = mask_path
+            regions_name = run_settings.get("height_regions") or ""
+            if regions_name:
+                regions_path = get_image_service().get_path(regions_name)
+                if regions_path is None:
+                    err = (f"Height regions not found: {regions_name}. "
+                           "Clear the painted height regions, or paint them again.")
+                    logger.error(err)
+                    svc.update_status(job.job_id, "failed", error=err)
+                    return
+                run_settings["height_regions"] = regions_path
 
             logger.info("Optimization starting: image=%s, filaments=%d, iters=%d",
                         input_image_path, len(filament_dicts), settings.iterations)
@@ -372,6 +386,14 @@ async def start_optimization(settings: OptimizationSettings):
                     }
             except Exception:
                 logger.exception("Could not count the result of job %s", job.job_id)
+            try:
+                from ..helpers.sliders import guidance_report_from_optimizer
+
+                report = guidance_report_from_optimizer(result["optimizer"])
+                if report is not None:
+                    counts["guidance_report"] = report
+            except Exception:
+                logger.exception("Could not report the height guidance of job %s", job.job_id)
             svc.update_status(job.job_id, "completed",
                               phase=None,
                               progress=100.0,

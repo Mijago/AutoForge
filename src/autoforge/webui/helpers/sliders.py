@@ -158,6 +158,25 @@ def result_counts_from_optimizer(optimizer) -> dict | None:
     }
 
 
+def guidance_report_from_optimizer(optimizer) -> dict | None:
+    """How the optimizer's current solution follows its height guidance
+    (HeightGuidance.report, each pin with its filament's uuid), or None
+    without guidance."""
+    g = getattr(optimizer, "guidance", None)
+    if g is None or getattr(g, "hidden", False):
+        # The hidden default guidance (pipeline_runner) is never reported.
+        return None
+    disc_global, disc_height_image = optimizer.get_discretized_solution(best=True)
+    if disc_global is None or disc_height_image is None:
+        return None
+    report = g.report(disc_global, disc_height_image, optimizer.base_material, optimizer.background)
+    uuids = list(getattr(g, "material_uuids", []) or [])
+    for pin in report["pins"]:
+        m = pin["material"]
+        pin["uuid"] = uuids[m] if 0 <= m < len(uuids) else None
+    return report
+
+
 def derive_layer_range_from_result(result: dict):
     """Return just ``{"min_layer": int, "max_layer": int}`` for a pipeline
     result, without grouping the discrete solution into material segments.

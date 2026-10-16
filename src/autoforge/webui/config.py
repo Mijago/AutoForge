@@ -26,6 +26,10 @@ class WebUIConfig(BaseSettings):
     # reloads). AUTOFORGE_WEBUI_FILAMENTCOLORS_AUTO_UPDATE=false disables it.
     filamentcolors_auto_update: bool = True
     filamentcolors_check_interval_hours: float = 1.0
+    # Load the depth model (the runs' default height guidance) on a
+    # background thread at startup, so the first run doesn't wait for it.
+    # AUTOFORGE_WEBUI_PRELOAD_DEPTH_MODEL=false disables it.
+    preload_depth_model: bool = True
 
     # PostHog telemetry — anonymous usage analytics, on by default for every
     # install so the project has aggregate usage data. This is the project's

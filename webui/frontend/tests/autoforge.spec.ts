@@ -410,11 +410,13 @@ test.describe('Color Core Panel', () => {
     }
   })
 
-  test('segments render for each layer up to max', async ({ page }) => {
+  test('segments render for each layer up to the top of the print', async ({ page }) => {
+    // The column spans layers 1..top (the heightmap's top, max_layers before
+    // there is one), not just up to the highest band.
     const segments = page.locator('[data-testid^="color-core-segment-"]')
-    const count = await segments.count()
-    expect(count).toBeGreaterThan(0)
-    expect(count).toBeLessThanOrEqual(27)
+    const top = Number(await page.locator('[data-testid="color-core"]').getAttribute('data-top-layer'))
+    expect(top).toBeGreaterThan(0)
+    await expect(segments).toHaveCount(top)
   })
 
   test('each segment has a background color', async ({ page }) => {
@@ -469,9 +471,8 @@ test.describe('Color Core Panel', () => {
     // Handles are sorted by ascending layer value, so the handle for
     // slider-column-0 may no longer be at handle index 0 once its value
     // changes relative to the other columns — look for the value instead.
-    const handles = page.locator('[data-testid^="color-core-handle-"]')
-    const texts = await handles.allTextContents()
-    expect(texts.some((t) => t.includes('15'))).toBe(true)
+    // (Packed handles hide their numbers, so read the layer they sit at.)
+    await expect(page.locator('[data-testid^="color-core-handle-"][data-layer="15"]')).toHaveCount(1)
   })
 
   test('color core updates when slider is disabled', async ({ page }) => {
@@ -1579,6 +1580,7 @@ test.describe('Pruning Flow', () => {
     // a reduction of its own), so ask for a real cut — otherwise the
     // reduction phases have nothing to do and the job finishes before
     // Pause/Cancel can be clicked.
+    await page.locator('[data-testid="pruning-mode-manual"]').click()
     for (const [testId, value] of [['pruning-max-colors', '3'], ['pruning-max-swaps', '2'], ['pruning-max-layer', '18']]) {
       const field = page.locator(`[data-testid="${testId}"]`)
       await field.fill(value)

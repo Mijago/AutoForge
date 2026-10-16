@@ -31,12 +31,20 @@ export function staleReasons(
   // the run or now.
   const noMask = !run.settings.priority_mask && !settings.priority_mask
   const reasons = Object.keys(settings)
-    .filter((key) => !IGNORED.has(key) && key in run.settings && run.settings[key] !== settings[key])
+    .filter((key) => !IGNORED.has(key) && key in run.settings && !sameSetting(run.settings[key], settings[key]))
     .filter((key) => !(noMask && key === 'priority_mask_strength'))
   const before = [...run.filamentUuids].sort().join(',')
   const after = [...activeFilamentUuids].sort().join(',')
   if (before !== after) reasons.push('active_filaments')
   return reasons
+}
+
+/** Settings values compare by content: an object setting (the height
+ * guidance) comes back from storage as a new object every time. */
+function sameSetting(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (a && b && typeof a === 'object' && typeof b === 'object') return JSON.stringify(a) === JSON.stringify(b)
+  return false
 }
 
 const STORAGE_KEY = 'autoforge-run-inputs'

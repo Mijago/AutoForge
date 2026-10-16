@@ -61,6 +61,7 @@ test('the pruning dialog opens on the result you already have', async ({ page, r
   await byTestId(page, 'top-pruning-btn').click()
   await expect(byTestId(page, 'pruning-modal')).toBeVisible()
 
+  await byTestId(page, 'pruning-mode-manual').click()
   // Item 7: the limits are the current counts, not a reduction the dialog
   // decided on. Pressing Start now accepts what the user is looking at.
   for (const [count, limit] of [
@@ -87,6 +88,7 @@ test('the counts in the pruning overlay move while it runs', async ({ page, requ
   await expect(byTestId(page, 'pruning-modal')).toBeVisible()
 
   // Ask for a real reduction so there is something to watch come down.
+  await byTestId(page, 'pruning-mode-manual').click()
   const colors = byTestId(page, 'pruning-max-colors')
   const startColors = Number(await byTestId(page, 'pruning-current-colors').getAttribute('data-value'))
   await colors.fill(String(Math.max(2, startColors - 2)))
@@ -125,6 +127,7 @@ test('the polish passes run before pruning, are switchable, and only ever help',
   await byTestId(page, 'top-pruning-btn').click()
   await expect(byTestId(page, 'pruning-modal')).toBeVisible()
 
+  await byTestId(page, 'pruning-mode-manual').click()
   // Color-seed search is on by default (cheap); height fine-tuning is off
   // (slower) — both are switchable.
   await expect(byTestId(page, 'pruning-seed-search')).toBeChecked()
@@ -258,6 +261,7 @@ test('auto-repeat keeps pruning until a pass stops improving', async ({ page, re
   await byTestId(page, 'top-pruning-btn').click()
   await expect(byTestId(page, 'pruning-modal')).toBeVisible()
 
+  await byTestId(page, 'pruning-mode-manual').click()
   // Off unless asked for: every pass is real GPU time.
   const toggle = byTestId(page, 'pruning-auto-repeat')
   await expect(toggle).not.toBeChecked()

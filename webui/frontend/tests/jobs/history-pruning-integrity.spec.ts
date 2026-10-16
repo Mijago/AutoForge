@@ -115,6 +115,8 @@ async function runPruningPass(
   page: Page,
   delta: { colors: number; swaps: number; layers: number },
 ) {
+  // The dialog opens on the automatic tab; the limits are on the manual one.
+  await byTestId(page, 'pruning-mode-manual').click()
   const curColors = Number(await byTestId(page, 'pruning-current-colors').getAttribute('data-value'))
   const curSwaps = Number(await byTestId(page, 'pruning-current-swaps').getAttribute('data-value'))
   const curLayers = Number(await byTestId(page, 'pruning-current-layers').getAttribute('data-value'))

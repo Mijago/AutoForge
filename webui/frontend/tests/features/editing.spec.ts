@@ -364,7 +364,7 @@ test.describe('App shell', () => {
   test('Pruning needs a finished result first', async ({ page }) => {
     await openApp(page)
     await expect(byTestId(page, 'top-pruning-btn')).toBeDisabled()
-    await expect(byTestId(page, 'top-pruning-btn')).toHaveAttribute('title', 'Run an optimization first')
+    await expect(byTestId(page, 'top-pruning-btn')).toHaveAttribute('title', 'Run an optimization, or assign filaments to the color layers, first')
   })
 
   test('a failing Run explains why and the message clears once fixed', async ({ page, request }) => {

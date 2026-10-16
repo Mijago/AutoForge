@@ -80,7 +80,8 @@ test('loading a different image after a run, a prune and a history jump clears t
   // 3D preview" meant.
   await expect(byTestId(page, 'three-d-view')).toHaveCount(0)
   await expect(byTestId(page, 'result-image')).toHaveCount(0)
-  await expect(byTestId(page, 'top-pruning-btn')).toBeDisabled()
+  // (Pruning may be enabled again: once the new image's preview is ready,
+  // its assigned color bands can be pruned - see lib/jobTracking.pruneSource.)
 
   // And the new image gets its own heightmap preview, not the old one.
   await expect(byTestId(page, 'init-three-d-view')).toBeVisible({ timeout: 120_000 })
@@ -108,15 +109,15 @@ test('the backend keeps only the newest run, so several images do not pile up', 
     expect(done.status, done.error ?? '').toBe('completed')
   }
 
-  // The older run's pipeline state was released when the newer run started,
-  // so pruning it finds nothing to prune from; the newest one still works.
-  const stale = await request.post('/api/pruning/start', {
+  // The older run's pipeline state was released when the newer run started;
+  // pruning it rebuilds it from its saved solution (helpers/result_store.py)
+  // instead of keeping every run in memory. The newest one works as well.
+  const older = await request.post('/api/pruning/start', {
     data: { pruning_max_colors: 4, pruning_max_swaps: 4, pruning_max_layer: 18, job_id: ids[0] },
   })
-  expect(stale.ok(), await stale.text()).toBeTruthy()
-  const staleJob = await waitForJob(request, (await stale.json()).job_id)
-  expect(staleJob.status).toBe('failed')
-  expect(staleJob.error ?? '').toContain('No optimization pipeline result')
+  expect(older.ok(), await older.text()).toBeTruthy()
+  const olderJob = await waitForJob(request, (await older.json()).job_id)
+  expect(olderJob.status, olderJob.error ?? '').toBe('completed')
 
   const fresh = await request.post('/api/pruning/start', {
     data: { pruning_max_colors: 4, pruning_max_swaps: 6, pruning_max_layer: 18, job_id: ids[1] },

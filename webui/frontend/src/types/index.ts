@@ -1,3 +1,5 @@
+import type { GuidanceReport, HeightGuidanceSettings } from '../lib/heightGuidance'
+
 export interface Filament {
   brand: string
   name: string
@@ -73,6 +75,10 @@ export interface OptimizationSettings {
   priority_mask: string
   /** How many times more a painted focus-area pixel counts (2–100 in the UI). */
   priority_mask_strength: number
+  /** Height guidance (lib/heightGuidance); null when nothing is suggested. */
+  height_guidance: HeightGuidanceSettings | null
+  /** The painted raise/lower regions (a file in uploads/), or ''. */
+  height_regions: string
   visualize: boolean
 }
 
@@ -109,6 +115,8 @@ export interface JobStatus {
    * the image currently on screen. */
   input_image?: string | null
   flatforge?: boolean | null
+  /** How the result follows the height guidance (absent without guidance). */
+  guidance_report?: GuidanceReport | null
 }
 
 export interface AutoPrunePass {

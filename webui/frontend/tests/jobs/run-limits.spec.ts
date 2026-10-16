@@ -139,6 +139,7 @@ test('the automatic cleanup and a manual prune at the same limits keep to them',
   // Prune again by hand, at the limits the run had.
   await byTestId(page, 'top-pruning-btn').click()
   await expect(byTestId(page, 'pruning-modal')).toBeVisible()
+  await byTestId(page, 'pruning-mode-manual').click()
   await typeInto(page, 'pruning-max-colors', String(MAX_COLORS))
   await typeInto(page, 'pruning-max-swaps', String(MAX_SWAPS))
   const started = page.waitForResponse((r) => r.url().endsWith('/api/pruning/start') && r.request().method() === 'POST')

@@ -22,6 +22,7 @@ import { buildPrintPlan } from '../lib/printPlan'
 import { effectiveBaseColor, effectiveBaseFilamentUuid } from '../lib/baseColor'
 import { blobToDataUrl, dataUrlToBlob, embeddedImageName, heightmapSource, isImageDataUrl, isSavedHeightmap, type SavedHeightmap } from '../lib/projectFile'
 import { projectFileName, projectFingerprint, projectNameFromFile } from '../lib/project'
+import type { HeightGuidanceSettings } from '../lib/heightGuidance'
 
 // Module-level undo stack — NOT in Zustand store to avoid infinite loops via subscribe
 const UNDO_STACK: Snapshot[] = []
@@ -270,6 +271,7 @@ async function shareableProjectFile(state: AppState): Promise<{ data: Record<str
   }
   if (state.settings.input_image) await embed(state.settings.input_image, 'inputImageData', 'the image')
   if (state.settings.priority_mask) await embed(state.settings.priority_mask, 'priorityMaskData', 'the focus areas')
+  if (state.settings.height_regions) await embed(state.settings.height_regions, 'heightRegionsData', 'the height regions')
   const source = heightmapSource(state.currentJob, state.initState.status)
   if (source) {
     try {
@@ -374,6 +376,8 @@ export const defaultSettings: OptimizationSettings = {
   init_heightmap_method: 'kmeans',
   priority_mask: '',
   priority_mask_strength: 10,
+  height_guidance: null,
+  height_regions: '',
   visualize: false,
 }
 
@@ -551,6 +555,19 @@ interface AppState {
   retryServerConnection: () => void
   /** The uploaded focus-area mask (a file in uploads/), or '' for none. */
   setPriorityMask: (filename: string) => void
+  /** Heights mode: the image panel and the color column edit the height
+   * guidance (see lib/heightGuidance). */
+  heightsMode: boolean
+  setHeightsMode: (on: boolean) => void
+  /** The latest quick preview's mesh (a small real run with the height
+   * guidance), shown in the 3D view while Heights mode is on; `stale` once
+   * the inputs changed since. */
+  heightsPreviewMesh: { url: string; stale: boolean } | null
+  setHeightsPreviewMesh: (mesh: { url: string; stale: boolean } | null) => void
+  /** The height guidance (null: none), as one undo step named `label`. */
+  setHeightGuidance: (guidance: HeightGuidanceSettings | null, label: string) => void
+  /** The painted height regions (a file in uploads/), or '' for none. */
+  setHeightRegions: (filename: string) => void
   applyUploadedImage: (filename: string, displayUrl: string) => Promise<void>
 
   // Undo/redo
@@ -702,7 +719,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     stopPruningPoll()
     set((state) => ({
       inputImage: null,
-      settings: { ...state.settings, input_image: '', priority_mask: '' },
+      settings: { ...state.settings, input_image: '', priority_mask: '', height_guidance: null, height_regions: '' },
       colorSliders: [],
       sliderLayerRange: { min: 0, max: state.settings.max_layers || 75 },
       currentJob: null,
@@ -1030,6 +1047,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       inputImage: string | null
       inputImageData: unknown
       priorityMaskData: unknown
+      heightRegionsData: unknown
       heightmap: unknown
       resolvedBase: ResolvedBase | null
     }>
@@ -1047,6 +1065,13 @@ export const useAppStore = create<AppState>((set, get) => ({
         parsed.settings.priority_mask = (await uploadDataUrl(parsed.priorityMaskData, 'focus-areas')).filename
       } catch {
         parsed.settings.priority_mask = ''
+      }
+    }
+    if (parsed.settings && isImageDataUrl(parsed.heightRegionsData)) {
+      try {
+        parsed.settings.height_regions = (await uploadDataUrl(parsed.heightRegionsData, 'height-regions')).filename
+      } catch {
+        parsed.settings.height_regions = ''
       }
     }
     const savedHeightmap: SavedHeightmap | null = isSavedHeightmap(parsed.heightmap) && parsed.settings?.input_image ? parsed.heightmap : null
@@ -1118,6 +1143,23 @@ export const useAppStore = create<AppState>((set, get) => ({
     queueCaptureSnapshot(filename ? 'Painted focus areas' : 'Cleared focus areas')
   },
 
+  heightsMode: false,
+  setHeightsMode: (on) => set({ heightsMode: on }),
+  heightsPreviewMesh: null,
+  setHeightsPreviewMesh: (mesh) => set({ heightsPreviewMesh: mesh }),
+  setHeightGuidance: (guidance, label) => {
+    const before = get().settings
+    if (JSON.stringify(before.height_guidance ?? null) === JSON.stringify(guidance ?? null)) return
+    set({ settings: { ...before, height_guidance: guidance } })
+    queueCaptureSnapshot(label)
+  },
+  setHeightRegions: (filename) => {
+    const before = get().settings
+    if (before.height_regions === filename) return
+    set({ settings: { ...before, height_regions: filename } })
+    queueCaptureSnapshot(filename ? 'Painted height regions' : 'Cleared height regions')
+  },
+
   applyUploadedImage: async (filename, displayUrl) => {
     // A new photo invalidates everything derived from the old one. Leaving
     // any of it in place is what made the 3D panel show the previous image:
@@ -1129,8 +1171,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     // useAutoPreviewInit start the new heightmap init, and a reset landing
     // after that had started would wipe the init it had just kicked off.
     await fetch('/api/init/reset?forget=true', { method: 'POST' }).catch(() => {})
-    // The focus-area mask was painted over the old picture's shapes.
-    const settings = { ...get().settings, input_image: filename, priority_mask: '' }
+    // The focus-area mask and the height regions were painted over the old
+    // picture's shapes.
+    const settings = { ...get().settings, input_image: filename, priority_mask: '', height_regions: '' }
     // The previous upload's local preview holds that whole file in memory.
     releaseReplacedObjectUrl(get().inputImage, displayUrl)
     set({
@@ -1751,8 +1794,9 @@ async function applyProjectFile(parsed: ParsedProjectFile, savedHeightmap: Saved
       // The project may come from another machine, whose uploads/ this
       // server doesn't have: a missing focus mask failed the next Run ("mask
       // not found") and a missing image showed a broken picture.
-      const missing = await missingUploads([settings.input_image, settings.priority_mask])
+      const missing = await missingUploads([settings.input_image, settings.priority_mask, settings.height_regions])
       if (settings.priority_mask && missing.has(settings.priority_mask)) settings.priority_mask = ''
+      if (settings.height_regions && missing.has(settings.height_regions)) settings.height_regions = ''
       if (settings.input_image && missing.has(settings.input_image)) {
         useAppStore.getState().pushToast("The project's image isn't on this server; upload it again.", 'warning')
         settings.input_image = ''

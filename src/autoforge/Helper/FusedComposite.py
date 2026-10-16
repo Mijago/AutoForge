@@ -52,8 +52,8 @@ if _HAS_TRITON:
     @triton.jit
     def _disc_composite_kernel(
         z_ptr, out_ptr, params_ptr, bg_ptr, H, W, L, h, inv_h, own, nbw,
-        tlab_ptr, wt_ptr, smooth, zstride,
-        ERR: tl.constexpr, BLOCK: tl.constexpr, LOSS: tl.constexpr = False,
+        tlab_ptr, wt_ptr, smooth, zstride, gt_ptr, gw_ptr, top_ptr, gtol,
+        ERR: tl.constexpr, BLOCK: tl.constexpr, LOSS: tl.constexpr = False, GUIDE: tl.constexpr = False,
     ):
         pid = tl.program_id(0)
         # Batch of stacks (grid axis 1): stack b reads its own [L,8] table;
@@ -154,7 +154,15 @@ if _HAS_TRITON:
             if LOSS:
                 tl.store(out_ptr + pb * tl.num_programs(0) + pid, tl.sum(tl.where(valid, e, 0.0), axis=0))
             else:
-                tl.store(out_ptr + offs, e + smooth * var, mask=valid)
+                e = e + smooth * var
+                if GUIDE:
+                    # The height guidance's pixel cost (HeightGuidance.
+                    # pixel_cost_map; the pull is pre-scaled).
+                    gt = tl.load(gt_ptr + offs, mask=valid, other=0.0)
+                    gw = tl.load(gw_ptr + offs, mask=valid, other=0.0)
+                    dev = tl.maximum(tl.abs(zf / tl.load(top_ptr) - gt) - gtol, 0.0)
+                    e = e + gw * dev * dev
+                tl.store(out_ptr + offs, e, mask=valid)
         else:
             o = out_ptr + offs * 3
             tl.store(o + 0, cr * 255.0, mask=valid)
@@ -215,15 +223,17 @@ def composite_heights(z: torch.Tensor, params: torch.Tensor, bg: torch.Tensor, h
     grid = (triton.cdiv(H * W, BLOCK),)
     _disc_composite_kernel[grid](
         zi, out, params.contiguous(), bg, H, W, int(params.shape[0]),
-        float(h), 1.0 / float(h), *_bleed_weights(), out, out, 0.0, 0, ERR=False, BLOCK=BLOCK,
+        float(h), 1.0 / float(h), *_bleed_weights(), out, out, 0.0, 0, out, out, out, 0.0, ERR=False, BLOCK=BLOCK,
     )
     return out
 
 
-def heights_error(z, params, bg: torch.Tensor, h: float, target_lab, weights, smooth: float) -> torch.Tensor:
+def heights_error(z, params, bg: torch.Tensor, h: float, target_lab, weights, smooth: float, guided=None) -> torch.Tensor:
     """[H,W] per-pixel refine error of heights ``z``: weighted Lab squared
     error of the composite against ``target_lab`` plus ``smooth`` times the
-    8-neighbour height variation (see PixelHeightRefine._height_variation)."""
+    8-neighbour height variation (see PixelHeightRefine._height_variation).
+    ``guided`` = (target heights [H,W], pulls [H,W] times the scale, top
+    0-dim tensor, tolerance) adds the height guidance's pixel cost."""
     H, W = z.shape
     zi = z.to(torch.int32).contiguous()
     out = torch.empty(H, W, device=z.device, dtype=torch.float32)
@@ -232,7 +242,8 @@ def heights_error(z, params, bg: torch.Tensor, h: float, target_lab, weights, sm
     _disc_composite_kernel[grid](
         zi, out, params.contiguous(), bg, H, W, int(params.shape[0]),
         float(h), 1.0 / float(h), *_bleed_weights(), target_lab.contiguous(), weights.contiguous(), float(smooth), 0,
-        ERR=True, BLOCK=BLOCK,
+        *(guided if guided is not None else (out, out, out, 0.0)),
+        ERR=True, BLOCK=BLOCK, GUIDE=guided is not None,
     )
     return out
 
@@ -1206,7 +1217,7 @@ def batched_heights_error_sum(z, params: torch.Tensor, bg: torch.Tensor, h: floa
     _disc_composite_kernel[(nblk, B)](
         zi, part, params.contiguous(), bg, H, W, L,
         float(h), 1.0 / float(h), *_bleed_weights(), target_lab.contiguous(), weights.contiguous(), 0.0, zstride,
-        ERR=True, BLOCK=BLOCK, LOSS=True,
+        part, part, part, 0.0, ERR=True, BLOCK=BLOCK, LOSS=True,
     )
     out = torch.empty(B, device=z.device, dtype=torch.float32)
     _rowsum_kernel[(B,)](part, out, nblk, BLOCK=1024)
@@ -1606,14 +1617,141 @@ if _HAS_TRITON:
         tl.store(part_ptr + b * nblk + blk, tl.sum(tl.where(valid, best * w, 0.0), axis=0))
 
 
-def proxy_losses(pal_lab: torch.Tensor, t_lab: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """[B] sum_i w_i min_k |t_i - pal_lab[b,k]|^2 / 3."""
+if _HAS_TRITON:
+
+    @triton.jit
+    def _proxy_guided_kernel(pal_ptr, t_ptr, w_ptr, ht_ptr, hw_ptr, top_ptr, part_ptr, N, n, nblk,
+                             scale, tol, BLOCK: tl.constexpr):
+        """_proxy_kernel plus each point's height guidance cost at every
+        height k: scale * pull * max(|k / top - target| - tol, 0)^2."""
+        b = tl.program_id(0)
+        blk = tl.program_id(1)
+        offs = blk * BLOCK + tl.arange(0, BLOCK)
+        valid = offs < N
+        t0 = tl.load(t_ptr + offs * 3 + 0, mask=valid, other=0.0)
+        t1 = tl.load(t_ptr + offs * 3 + 1, mask=valid, other=0.0)
+        t2 = tl.load(t_ptr + offs * 3 + 2, mask=valid, other=0.0)
+        ht = tl.load(ht_ptr + offs, mask=valid, other=0.0)
+        hw = tl.load(hw_ptr + offs, mask=valid, other=0.0) * scale
+        inv_top = 1.0 / tl.load(top_ptr)
+        best = tl.full([BLOCK], float("inf"), tl.float32)
+        p = pal_ptr + b * n * 3
+        for k in range(0, n):
+            d0 = t0 - tl.load(p + k * 3 + 0)
+            d1 = t1 - tl.load(p + k * 3 + 1)
+            d2 = t2 - tl.load(p + k * 3 + 2)
+            dev = tl.maximum(tl.abs(k * inv_top - ht) - tol, 0.0)
+            best = tl.minimum(best, d0 * d0 + d1 * d1 + d2 * d2 + hw * dev * dev)
+        w = tl.load(w_ptr + offs, mask=valid, other=0.0)
+        tl.store(part_ptr + b * nblk + blk, tl.sum(tl.where(valid, best * w, 0.0), axis=0))
+
+
+if _HAS_TRITON:
+
+    @triton.jit
+    def _proxy_guided_tile_kernel(pal_ptr, t_ptr, w_ptr, ht_ptr, hw_ptr, top_ptr, part_ptr, B, N, n, nblk,
+                                  scale, tol, BB: tl.constexpr, BLOCK: tl.constexpr):
+        """_proxy_guided_kernel for a tile of BB stacks per program: the
+        height cost of a point at a height is the same for every stack, so
+        it is computed once per tile (the same per-element arithmetic)."""
+        pb = tl.program_id(0)
+        blk = tl.program_id(1)
+        offs = blk * BLOCK + tl.arange(0, BLOCK)
+        valid = offs < N
+        bs = pb * BB + tl.arange(0, BB)
+        bvalid = bs < B
+        t0 = tl.load(t_ptr + offs * 3 + 0, mask=valid, other=0.0)[None, :]
+        t1 = tl.load(t_ptr + offs * 3 + 1, mask=valid, other=0.0)[None, :]
+        t2 = tl.load(t_ptr + offs * 3 + 2, mask=valid, other=0.0)[None, :]
+        ht = tl.load(ht_ptr + offs, mask=valid, other=0.0)
+        hw = tl.load(hw_ptr + offs, mask=valid, other=0.0) * scale
+        inv_top = 1.0 / tl.load(top_ptr)
+        best = tl.full([BB, BLOCK], float("inf"), tl.float32)
+        p = pal_ptr + bs * (n * 3)
+        for k in range(0, n):
+            dev = tl.maximum(tl.abs(k * inv_top - ht) - tol, 0.0)
+            hc = (hw * dev * dev)[None, :]
+            d0 = t0 - tl.load(p + k * 3 + 0, mask=bvalid, other=0.0)[:, None]
+            d1 = t1 - tl.load(p + k * 3 + 1, mask=bvalid, other=0.0)[:, None]
+            d2 = t2 - tl.load(p + k * 3 + 2, mask=bvalid, other=0.0)[:, None]
+            best = tl.minimum(best, d0 * d0 + d1 * d1 + d2 * d2 + hc)
+        w = tl.load(w_ptr + offs, mask=valid, other=0.0)[None, :]
+        sums = tl.sum(tl.where(valid[None, :], best * w, 0.0), axis=1)
+        tl.store(part_ptr + bs * nblk + blk, sums, mask=bvalid)
+
+
+# Stacks per program of _proxy_guided_tile_kernel, and the batch size from
+# which it beats one stack per program (measured on an RTX 3080: 608 stacks
+# x 7371 points 477 -> 267 us; small batches are as fast either way).
+if _HAS_TRITON:
+
+    @triton.jit
+    def _proxy_guided_dot_kernel(pal_ptr, t_ptr, w_ptr, ht_ptr, hw_ptr, top_ptr, part_ptr, B, N, n, nblk,
+                                 scale, tol, BB: tl.constexpr, BLOCK: tl.constexpr):
+        """_proxy_guided_tile_kernel with the squared distance expanded,
+        |t|^2 + |p|^2 - 2 t.p: the point's |t|^2 plus its height cost and the
+        stack's |p|^2 are shared, leaving three FMAs per point, height and
+        stack."""
+        pb = tl.program_id(0)
+        blk = tl.program_id(1)
+        offs = blk * BLOCK + tl.arange(0, BLOCK)
+        valid = offs < N
+        bs = pb * BB + tl.arange(0, BB)
+        bvalid = bs < B
+        t0 = tl.load(t_ptr + offs * 3 + 0, mask=valid, other=0.0)
+        t1 = tl.load(t_ptr + offs * 3 + 1, mask=valid, other=0.0)
+        t2 = tl.load(t_ptr + offs * 3 + 2, mask=valid, other=0.0)
+        tt = t0 * t0 + t1 * t1 + t2 * t2
+        m0 = (-2.0 * t0)[None, :]
+        m1 = (-2.0 * t1)[None, :]
+        m2 = (-2.0 * t2)[None, :]
+        ht = tl.load(ht_ptr + offs, mask=valid, other=0.0)
+        hw = tl.load(hw_ptr + offs, mask=valid, other=0.0) * scale
+        inv_top = 1.0 / tl.load(top_ptr)
+        best = tl.full([BB, BLOCK], float("inf"), tl.float32)
+        p = pal_ptr + bs * (n * 3)
+        for k in range(0, n):
+            dev = tl.maximum(tl.abs(k * inv_top - ht) - tol, 0.0)
+            a = (tt + hw * dev * dev)[None, :]
+            p0 = tl.load(p + k * 3 + 0, mask=bvalid, other=0.0)
+            p1 = tl.load(p + k * 3 + 1, mask=bvalid, other=0.0)
+            p2 = tl.load(p + k * 3 + 2, mask=bvalid, other=0.0)
+            pp = (p0 * p0 + p1 * p1 + p2 * p2)[:, None]
+            c = (a + pp) + m0 * p0[:, None] + m1 * p1[:, None] + m2 * p2[:, None]
+            best = tl.minimum(best, c)
+        best = tl.maximum(best, 0.0)
+        w = tl.load(w_ptr + offs, mask=valid, other=0.0)[None, :]
+        sums = tl.sum(tl.where(valid[None, :], best * w, 0.0), axis=1)
+        tl.store(part_ptr + bs * nblk + blk, sums, mask=bvalid)
+
+
+PROXY_TILE = 4
+PROXY_TILE_MIN_BATCH = 64
+
+
+def proxy_losses(pal_lab: torch.Tensor, t_lab: torch.Tensor, w: torch.Tensor, guided=None) -> torch.Tensor:
+    """[B] sum_i w_i min_k |t_i - pal_lab[b,k]|^2 / 3. ``guided`` = (target
+    heights [N], pulls [N], top 0-dim tensor, scale, tolerance) adds the
+    height guidance cost of every point at every height inside the min."""
     B, n, _ = pal_lab.shape
     N = t_lab.shape[0]
     BLOCK = 256
     nblk = triton.cdiv(N, BLOCK)
     part = torch.empty(B, nblk, device=pal_lab.device, dtype=torch.float32)
-    _proxy_kernel[(B, nblk)](
-        pal_lab.to(torch.float32).contiguous(), t_lab, w, part, N, n, nblk, BLOCK=BLOCK,
-    )
+    if guided is None:
+        _proxy_kernel[(B, nblk)](
+            pal_lab.to(torch.float32).contiguous(), t_lab, w, part, N, n, nblk, BLOCK=BLOCK,
+        )
+    else:
+        ht, hw, top, scale, tol = guided
+        if B >= PROXY_TILE_MIN_BATCH:
+            _proxy_guided_dot_kernel[(triton.cdiv(B, PROXY_TILE), nblk)](
+                pal_lab.to(torch.float32).contiguous(), t_lab, w, ht, hw, top, part, B, N, n, nblk,
+                float(scale), float(tol), BB=PROXY_TILE, BLOCK=BLOCK, num_warps=1,
+            )
+        else:
+            _proxy_guided_kernel[(B, nblk)](
+                pal_lab.to(torch.float32).contiguous(), t_lab, w, ht, hw, top, part, N, n, nblk,
+                float(scale), float(tol), BLOCK=BLOCK,
+            )
     return part.sum(1) / 3.0

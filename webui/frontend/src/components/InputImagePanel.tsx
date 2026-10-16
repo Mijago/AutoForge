@@ -16,6 +16,7 @@ import {
   Image as ImageIcon,
   Layers,
   Loader2,
+  Mountain,
   RefreshCw,
   SplitSquareHorizontal,
   Trash2,
@@ -26,6 +27,8 @@ import {
 import { FocusMaskOverlay, useFocusMask, type FocusTool } from './FocusMask'
 import { DifferenceImage, DifferenceLegend, useDifferenceMap } from './DifferenceView'
 import { DEFAULT_FOCUS_STRENGTH, sliderFromStrength, strengthFromSlider } from '../lib/focusMask'
+import { HeightsControls, HeightsImage, HeightsToolbar, useHeightsKeys, useHeightsMode } from './HeightsMode'
+import { suggestionCount } from '../lib/heightGuidance'
 
 const VIEWS: View[] = ['original', 'result', 'split', 'compare', 'difference']
 const VIEW_LABELS: Record<View, string> = { original: 'Original', result: 'Result', split: 'Side by side', compare: 'Compare', difference: 'Differences' }
@@ -144,6 +147,15 @@ export const InputImagePanel: React.FC = () => {
   const [tool, setTool] = useState<FocusTool>('paint')
   const [brushPercent, setBrushPercent] = usePersistentState<number>('autoforge-focus-brush-size', 6)
 
+  // Heights mode: suggestions where colors sit in the print (see
+  // HeightsMode); the color column edits its pins at the same time.
+  const heightsMode = useAppStore((s) => s.heightsMode)
+  const setHeightsMode = useAppStore((s) => s.setHeightsMode)
+  const heights = useHeightsMode(heightsMode && !!inputImage)
+  const suggestions = useAppStore((s) => suggestionCount(s.settings.height_guidance, !!s.settings.height_regions))
+  const stopHeights = useCallback(() => setHeightsMode(false), [setHeightsMode])
+  useHeightsKeys(heightsMode, heights, stopHeights)
+
   const jobActive = !!currentJob && ['pending', 'running', 'paused'].includes(currentJob.status)
   // The printed result, next to the original: the optimizer's image (or the
   // slider-edited one) once done, the live preview while running.
@@ -152,17 +164,26 @@ export const InputImagePanel: React.FC = () => {
     : jobActive && previewImage
       ? previewImage
       : null
-  const effectiveView: View = painting ? 'original' : resultSrc ? view : 'original'
+  const effectiveView: View = painting || heightsMode ? 'original' : resultSrc ? view : 'original'
   // Only compared while the Differences view is on screen.
   const diff = useDifferenceMap(effectiveView === 'difference' ? inputImage : null, effectiveView === 'difference' ? resultSrc : null)
 
   const startPainting = useCallback(() => {
     setTool('paint')
     setPainting(true)
-  }, [])
+    setHeightsMode(false)
+  }, [setHeightsMode])
 
-  // A new picture ends painting (its mask starts empty).
-  useEffect(() => setPainting(false), [inputImage])
+  const startHeights = useCallback(() => {
+    setPainting(false)
+    setHeightsMode(true)
+  }, [setHeightsMode])
+
+  // A new picture ends painting (its mask starts empty), and Heights mode.
+  useEffect(() => {
+    setPainting(false)
+    setHeightsMode(false)
+  }, [inputImage, setHeightsMode])
 
   // Keys while painting: Esc or Enter finishes, B/E switch brush and
   // eraser, [ and ] change the brush size.
@@ -414,6 +435,19 @@ export const InputImagePanel: React.FC = () => {
     </div>
   )
 
+  const heightsView = inputImage && (
+    <div className="w-full h-full flex flex-col min-h-0" data-testid="heights-view">
+      <div className="flex-1 min-h-0">
+        <ZoomViewport zoom={zoom} setZoom={setZoom} paintMode testId="heights-viewport">
+          <div className="absolute inset-0" style={transformStyle(zoom)}>
+            <HeightsImage mode={heights} imageSrc={inputImage} originalImg={originalImg} />
+          </div>
+        </ZoomViewport>
+      </div>
+      <HeightsControls mode={heights} />
+    </div>
+  )
+
   const segButton = (on: boolean) =>
     `flex items-center gap-1 px-2 py-0.5 whitespace-nowrap ${on ? 'bg-gray-600 text-gray-100' : 'text-gray-400 hover:text-gray-200 hover:bg-gray-700/60'} disabled:opacity-40 disabled:hover:text-gray-400 disabled:hover:bg-transparent`
   const outlineButton = 'flex items-center gap-1 px-2 py-0.5 rounded text-xs text-gray-300 hover:bg-gray-700 border border-gray-600 whitespace-nowrap'
@@ -515,6 +549,22 @@ export const InputImagePanel: React.FC = () => {
         {focusLabel && 'Focus'}
         {hasFocusAreas && <span className="w-1.5 h-1.5 rounded-full bg-cyan-400" aria-hidden data-testid="focus-areas-dot" />}
       </button>
+      <button
+        onClick={startHeights}
+        className={`relative ${outlineButton} ${suggestions > 0 ? 'border-cyan-600 text-cyan-300' : ''}`}
+        title={
+          suggestions > 0
+            ? `${suggestions} height suggestion${suggestions === 1 ? '' : 's'} set — click to change them`
+            : 'Suggest which colors sit where in the print: pin filaments to heights, follow the photo depth, raise or lower parts'
+        }
+        aria-label="Heights"
+        data-testid="heights-btn"
+        data-active={suggestions > 0 || undefined}
+      >
+        <Mountain className="w-3 h-3" />
+        {focusLabel && 'Heights'}
+        {suggestions > 0 && <span className="text-[10px] tabular-nums text-cyan-300" data-testid="heights-count">{suggestions}</span>}
+      </button>
       <button onClick={() => fileInputRef.current?.click()} className={outlineButton} title="Upload a different image" aria-label="Change image" data-testid="change-image-btn">
         <RefreshCw className="w-3 h-3" />
         {changeLabel && 'Change'}
@@ -523,13 +573,13 @@ export const InputImagePanel: React.FC = () => {
   )
 
   return (
-    <div className={`flex flex-col h-full bg-gray-800 rounded-lg overflow-hidden ${flashing ? 'ring-2 ring-cyan-500' : ''} ${painting ? 'ring-1 ring-cyan-600' : ''}`} data-testid="image-panel">
+    <div className={`flex flex-col h-full bg-gray-800 rounded-lg overflow-hidden ${flashing ? 'ring-2 ring-cyan-500' : ''} ${painting || heightsMode ? 'ring-1 ring-cyan-600' : ''}`} data-testid="image-panel">
       <div ref={headerRef} className="flex items-center justify-between gap-2 px-3 py-1.5 border-b border-gray-700 min-h-9">
         <h3 className="text-xs font-semibold text-gray-300 flex items-center gap-1 flex-shrink-0">
-          {painting ? <Crosshair className="w-3.5 h-3.5 text-cyan-400" /> : <ImageIcon className="w-3.5 h-3.5" />}
-          {painting ? 'Focus areas' : 'Image'}
+          {painting ? <Crosshair className="w-3.5 h-3.5 text-cyan-400" /> : heightsMode ? <Mountain className="w-3.5 h-3.5 text-cyan-400" /> : <ImageIcon className="w-3.5 h-3.5" />}
+          {painting ? 'Focus areas' : heightsMode ? 'Heights' : 'Image'}
         </h3>
-        {inputImage && (painting ? paintToolbar : viewControls)}
+        {inputImage && (painting ? paintToolbar : heightsMode ? <HeightsToolbar mode={heights} compact={!changeLabel} onDone={stopHeights} /> : viewControls)}
       </div>
 
       <div
@@ -538,12 +588,12 @@ export const InputImagePanel: React.FC = () => {
         onDragOver={handleDragOver}
         onDragEnter={handleDragEnter}
         onDragLeave={() => setIsDragging(false)}
-        title={inputImage && !painting ? 'Scroll to zoom, drag to pan, double-click to reset' : undefined}
+        title={inputImage && !painting && !heightsMode ? 'Scroll to zoom, drag to pan, double-click to reset' : undefined}
       >
         {fileInput}
         {inputImage ? (
           <>
-            {effectiveView === 'original' && (painting ? paintView : viewport(originalImg))}
+            {effectiveView === 'original' && (painting ? paintView : heightsMode ? heightsView : viewport(originalImg))}
             {effectiveView === 'result' && viewport(resultImg)}
             {effectiveView === 'split' && (
               <div className="w-full h-full grid grid-cols-2 gap-2">

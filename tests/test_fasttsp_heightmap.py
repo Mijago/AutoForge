@@ -147,3 +147,26 @@ def test_init_height_map_emits_per_layer_material_logits_when_palette_given():
     global_logits = out[1]
     assert global_logits is not None
     assert np.asarray(global_logits).shape == (8, 4)
+
+
+def test_height_guidance_orders_the_init_clusters_by_their_target_heights():
+    """With pixel height guidance the starting heights and stack follow the
+    targets, not the colour order: the white block, which the colour order
+    puts on top, is wanted at the base and the dark block at the top."""
+    img = _blocky_image()
+    material_colors = np.array(
+        [[0.1, 0.1, 0.1], [0.8, 0.1, 0.1], [0.1, 0.8, 0.1], [0.9, 0.9, 0.9]],
+        dtype=np.float32,
+    )
+    tgt = np.full(img.shape[:2], 0.5, np.float32)
+    tgt[:20, :20] = 1.0  # the dark block up
+    tgt[20:, 20:] = 0.0  # the white block down
+    out = init_height_map(
+        img, max_layers=8, h=0.2, background_tuple=[20, 20, 20], random_seed=0, cluster_layers=4,
+        material_colors=material_colors, height_target=(tgt, np.ones_like(tgt)),
+    )
+    recon = 1.0 / (1.0 + np.exp(-out[0]))
+    assert recon[:20, :20].mean() > 0.9
+    assert recon[20:, 20:].mean() < 0.1
+    stack = np.asarray(out[1]).argmax(axis=1)
+    assert stack[0] == 3 and stack[-1] == 0  # white printed first, dark on top

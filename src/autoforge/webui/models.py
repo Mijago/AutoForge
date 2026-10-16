@@ -60,6 +60,36 @@ class ColorSliderConfig(CamelCaseModel):
 
 
 
+class HeightPin(CamelCaseModel):
+    """A filament suggested at a height: ``position`` is a fraction of the
+    print's height (0 = the base, 1 = the top layer)."""
+    uuid: str
+    position: float = Field(0.5, ge=0.0, le=1.0)
+
+
+class HeightColorPick(CamelCaseModel):
+    """An image colour raised toward the top or lowered toward the base."""
+    color: str
+    tolerance: float = Field(15.0, ge=1.0, le=100.0)
+    direction: Literal["raise", "lower"] = "raise"
+
+    @field_validator("color")
+    @classmethod
+    def _hex(cls, v: str) -> str:
+        return normalize_hex_color(v)
+
+
+class HeightGuidanceSettings(CamelCaseModel):
+    """Height guidance (--height_guidance): soft suggestions where colours
+    sit in the print, weighed against the colour error by ``strength``."""
+    strength: float = Field(1.0, ge=0.0, le=100.0)
+    order: Literal["auto", "dark_to_light", "light_to_dark"] = "auto"
+    pins: list[HeightPin] = []
+    depth: bool = False
+    depth_flip: bool = False
+    colors: list[HeightColorPick] = []
+
+
 class OptimizationSettings(CamelCaseModel):
     # Ranges are enforced here so a bad value is rejected up front with a
     # message naming the field, instead of starting a job that dies with
@@ -140,6 +170,10 @@ class OptimizationSettings(CamelCaseModel):
     priority_mask: str = ""
     # How many times more a painted focus-area pixel counts (--priority_mask_strength).
     priority_mask_strength: float = Field(10.0, ge=1.0, le=1000.0)
+    # Height guidance and its painted raise/lower regions (an uploads/ file
+    # name, like priority_mask).
+    height_guidance: Optional[HeightGuidanceSettings] = None
+    height_regions: str = ""
     visualize: bool = False
 
     @model_validator(mode="after")
@@ -196,6 +230,9 @@ class JobStatus(CamelCaseModel):
     result_colors: Optional[int] = None
     result_swaps: Optional[int] = None
     result_layers: Optional[int] = None
+    # How the result follows the height guidance (see
+    # sliders.guidance_report_from_optimizer); None without guidance.
+    guidance_report: Optional[dict[str, Any]] = None
     # Which pruning pass is running, and how many are allowed, when pruning
     # repeats itself until it stops improving.
     pruning_pass: Optional[int] = None

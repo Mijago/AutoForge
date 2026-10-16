@@ -44,14 +44,20 @@ test('a run from the UI: progress, result view, and a single history step for it
   // the progress details); the progress chip is always there.
   await expect(byTestId(page, 'job-progress').or(byTestId(page, 'three-d-view'))).toBeVisible({ timeout: 30000 })
 
-  // One optimization at a time.
-  const second = await request.post('/api/optimize/start', { data: { input_image: 'x.png' } })
-  if (second.status() !== 400) {
-    const latest = await (await request.get('/api/optimize/latest')).json()
-    if (latest.status === 'running' || latest.status === 'paused') expect(second.status()).toBe(409)
+  // One optimization at a time: a second start while this run is active
+  // is refused. Paused first, so the run can't finish in between (on a fast
+  // GPU it used to, and the "second" start then became a real job that
+  // replaced this one as the latest and broke the tests after this one).
+  // Already done on a very fast GPU: nothing left to refuse.
+  const first = await (await request.get('/api/optimize/latest')).json()
+  jobId = first.job_id
+  const paused = await request.post(`/api/optimize/pause/${jobId}`)
+  if (paused.ok() && (await paused.json()).status === 'paused') {
+    const second = await request.post('/api/optimize/start', { data: { input_image: 'x.png' } })
+    expect(second.status()).toBe(409)
+    expect((await request.post(`/api/optimize/resume/${jobId}`)).ok()).toBeTruthy()
   }
 
-  jobId = (await (await request.get('/api/optimize/latest')).json()).job_id
   const done = await waitForJob(request, jobId)
   expect(done.status, done.error ?? '').toBe('completed')
 
@@ -217,6 +223,7 @@ test('pruning from the dialog reduces the stack and is an undo step', async ({ p
   const columnsBefore = await page.locator('[data-testid^="slider-column-"]').count()
 
   await byTestId(page, 'top-pruning-btn').click()
+  await byTestId(page, 'pruning-mode-manual').click()
   // The dialog shows what there is to reduce and opens on exactly those
   // numbers — it no longer proposes a reduction the user didn't ask for, so
   // the cut below is the user's own choice.

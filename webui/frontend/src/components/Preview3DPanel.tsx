@@ -252,6 +252,12 @@ export const Preview3DPanel: React.FC = () => {
     ? `${meshKeyForJob(INIT_JOB_SENTINEL)}?v=${meshVersion}`
     : null
 
+  // Heights mode: the latest quick preview (a small real run with the
+  // height guidance) instead of the result, labelled as what it is.
+  const heightsMode = useAppStore((s) => s.heightsMode)
+  const heightsPreviewMesh = useAppStore((s) => s.heightsPreviewMesh)
+  const showQuickPreview = heightsMode && !!heightsPreviewMesh && !optimizationStarted
+
   const showNoFilamentsWarning = inputImage && activeFilaments.length === 0 && initState.status !== 'initializing' && !previewImage
 
   return (
@@ -263,7 +269,20 @@ export const Preview3DPanel: React.FC = () => {
         </h3>
       </div>
       <div className="flex-1 relative overflow-hidden">
-        {stlFile ? (
+        {showQuickPreview ? (
+          <div key="quick-preview-3d" data-testid="quick-preview-3d" className="w-full h-full relative">
+            <ThreeDView coloredPlyUrl={heightsPreviewMesh!.url} className="w-full h-full" />
+            <div
+              className={`absolute bottom-2 left-2 right-2 px-2 py-1 rounded text-[11px] border pointer-events-none ${heightsPreviewMesh!.stale ? 'bg-amber-500/15 border-amber-500/40 text-amber-400' : 'bg-cyan-900/50 border-cyan-700 text-cyan-200'}`}
+              data-testid="quick-preview-3d-label"
+              data-stale={heightsPreviewMesh!.stale || undefined}
+            >
+              {heightsPreviewMesh!.stale
+                ? 'Quick preview — your suggestions changed since; preview again'
+                : 'Quick preview: a small, fast real run with your height suggestions. Run for the full result.'}
+            </div>
+          </div>
+        ) : stlFile ? (
           <div key="three-d-view" data-testid="three-d-view" className="w-full h-full">
             <ThreeDView coloredPlyUrl={coloredPlyUrl} className="w-full h-full" />
           </div>

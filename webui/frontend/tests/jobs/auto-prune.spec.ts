@@ -36,7 +36,10 @@ test('automatic pruning: pick a level, watch the passes, stay under the limit', 
   await byTestId(page, 'top-pruning-btn').click()
   await expect(byTestId(page, 'pruning-modal')).toBeVisible()
 
-  // Manual stays the default; the automatic tab swaps the limits for levels.
+  // The dialog opens on the automatic tab (levels instead of limits); the
+  // manual tab has the limits.
+  await expect(byTestId(page, 'pruning-max-colors')).toHaveCount(0)
+  await byTestId(page, 'pruning-mode-manual').click()
   await expect(byTestId(page, 'pruning-max-colors')).toBeVisible()
   await byTestId(page, 'pruning-mode-auto').click()
   await expect(byTestId(page, 'pruning-max-colors')).toHaveCount(0)
@@ -56,7 +59,7 @@ test('automatic pruning: pick a level, watch the passes, stay under the limit', 
   await expect(byTestId(page, 'pruning-again-btn')).toBeVisible({ timeout: 240_000 })
   const job = await latestJob(request)
   expect(job.status).toBe('completed')
-  expect(job.auto_target_loss).toBe(30)
+  expect(job.auto_target_loss).toBe(40) // the 'acceptable' level picked above
   expect(job.auto_outcome).toBeTruthy()
   if (job.auto_outcome === 'start_above_limit') {
     await expect(byTestId(page, 'pruning-modal-status')).toContainText('already over the loss limit')

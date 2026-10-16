@@ -61,7 +61,7 @@ from autoforge.Helper.OutputHelper import (
     generate_flatforge_stls,
     model_size_mm,
 )
-from autoforge.Modules.Optimizer import FilamentOptimizer
+from autoforge.Modules.Optimizer import FilamentOptimizer, _discretize_height_only
 
 # TorchScript's tensor-expression fuser compiles a fused kernel the first
 # time each scripted function sees a new input signature. The big [L,H,W]
@@ -671,6 +671,23 @@ def build_parser() -> configargparse.ArgParser:
         default=10.0,
         help="How many times more a fully white pixel of --priority_mask counts than a black one (>= 1; default 10).",
     )
+    parser.add_argument(
+        "--height_guidance",
+        type=str,
+        default="",
+        help="Height guidance: a JSON object (or a path to a .json file) suggesting where colours sit in the print - "
+        '{"strength": 1, "order": "auto|dark_to_light|light_to_dark", "pins": [{"filament": "<name or index>", '
+        '"position": 0.8}], "depth": false, "depth_flip": false, "colors": [{"color": "#rrggbb", "tolerance": 15, '
+        '"direction": "raise|lower"}]}. Positions are fractions of the print height (0 = base, 1 = top). '
+        "Soft: the optimizer trades it against the colour error.",
+    )
+    parser.add_argument(
+        "--height_regions",
+        type=str,
+        default="",
+        help="Optional RGBA image of painted height regions for --height_guidance: red strokes are raised toward "
+        "the top of the print, blue strokes lowered toward the base (alpha = how fully painted).",
+    )
 
     return parser
 
@@ -891,6 +908,86 @@ def _load_priority_mask(
 DEFAULT_PRIORITY_MASK_STRENGTH = 10.0
 
 
+def height_guidance_maps(args, output_img_np: np.ndarray, alpha: Optional[np.ndarray] = None, depth_fn=None):
+    """The pixel targets of --height_guidance / --height_regions at the
+    output resolution: ``(target, weight)`` or ``(None, None)``."""
+    from autoforge.Helper.HeightGuidance import GuidanceSpec, build_target_maps, parse_spec
+
+    raw = getattr(args, "height_guidance", "") or ""
+    regions_path = getattr(args, "height_regions", "") or ""
+    if not raw and not regions_path:
+        return None, None
+    spec = (parse_spec(raw) if raw else None) or GuidanceSpec()
+    if spec.strength <= 0:
+        return None, None
+    regions = None
+    if regions_path:
+        img = imread(regions_path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            raise FileNotFoundError(f"Height regions image not found: {regions_path}")
+        img = to_bgr_or_bgra_uint8(img)
+        if img.shape[2] == 4:
+            regions = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
+    return build_target_maps(spec, output_img_np, regions, alpha, depth_fn=depth_fn)
+
+
+def guidance_init_target(args, output_img_np: np.ndarray, alpha: Optional[np.ndarray] = None, depth_fn=None):
+    """``(target, weight)`` for the height map initialisation (see
+    init_height_map's ``height_target``), or None without pixel guidance."""
+    target, weight = height_guidance_maps(args, output_img_np, alpha, depth_fn)
+    if target is None or not np.any(weight > 0):
+        return None
+    return target, weight
+
+
+def attach_height_guidance(
+    optimizer: FilamentOptimizer,
+    args,
+    output_img_np: np.ndarray,
+    alpha: Optional[np.ndarray] = None,
+    material_names=(),
+    material_uuids=(),
+    material_colors_hex=(),
+    depth_fn=None,
+) -> None:
+    """Set ``optimizer.guidance`` from --height_guidance / --height_regions
+    (None when they ask for nothing). The maps are built at the output
+    resolution ``output_img_np``; the costs resize them as needed."""
+    from autoforge.Helper.HeightGuidance import (
+        HeightGuidance,
+        material_index_lookup,
+        parse_spec,
+    )
+
+    optimizer.guidance = None
+    raw = getattr(args, "height_guidance", "") or ""
+    regions_path = getattr(args, "height_regions", "") or ""
+    if not raw and not regions_path:
+        return
+    lookup = material_index_lookup(material_uuids, material_names, material_colors_hex)
+    spec = parse_spec(raw, lookup) if raw else None
+    if spec is None:
+        from autoforge.Helper.HeightGuidance import GuidanceSpec
+
+        spec = GuidanceSpec()
+    target, weight = height_guidance_maps(args, output_img_np, alpha, depth_fn)
+    g = HeightGuidance(
+        spec, optimizer.material_colors, optimizer.max_layers, target, weight, device=optimizer.device,
+        layer_height=optimizer.h,
+    )
+    if not g.active:
+        return
+    g.material_uuids = [str(u) for u in material_uuids]
+    # The axis of the pins and targets: the starting height map's top.
+    with torch.no_grad():
+        g.sync_top(_discretize_height_only(optimizer._apply_height_offset(), optimizer.h, optimizer.max_layers))
+    optimizer.guidance = g
+    print(
+        f"Height guidance: strength {spec.strength:g}, order {spec.order}, {len(g.pins)} pin(s)"
+        + (", pixel targets" if g.has_pixel else "")
+    )
+
+
 def priority_mask_scale(strength: float) -> float:
     """Factor for a 0..1 priority mask so a fully masked pixel counts
     `strength` times an unmasked one under compute_loss's weighting
@@ -907,6 +1004,7 @@ def _initialize_heightmap(
     material_colors_np: np.ndarray,
     random_seed: int,
     progress=None,
+    height_target=None,
 ) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
     """Initialize the height map logits & labels using selected method.
 
@@ -955,6 +1053,7 @@ def _initialize_heightmap(
                 focus_map=None,
                 num_runs=args.num_init_rounds,
                 progress=progress,
+                height_target=height_target,
             )
         )
     return pixel_height_logits_init, global_logits_init, pixel_height_labels
@@ -1536,6 +1635,7 @@ def start(args) -> float:
             bg_rgb,
             material_colors_np,
             random_seed,
+            height_target=guidance_init_target(args, output_img_np, alpha),
         )
     )
 
@@ -1577,6 +1677,10 @@ def start(args) -> float:
         perception_loss_module,
         focus_map_proc,
         alpha_proc=alpha_proc,
+    )
+    attach_height_guidance(
+        optimizer, args, output_img_np, alpha,
+        material_names=material_names, material_colors_hex=colors_list,
     )
 
     # Run optimization loop

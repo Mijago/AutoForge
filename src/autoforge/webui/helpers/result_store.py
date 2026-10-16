@@ -42,6 +42,8 @@ def _json_safe(value: Any) -> bool:
         return True
     if isinstance(value, (list, tuple)):
         return all(_json_safe(v) for v in value)
+    if isinstance(value, dict):
+        return all(isinstance(k, str) and _json_safe(v) for k, v in value.items())
     return False
 
 
@@ -252,9 +254,10 @@ def rebuild_pipeline_result(
     settings = dict(meta.get("args") or {})
     for key in ("input_image", "output_folder", "csv_file", "json_file"):
         settings.pop(key, None)
-    mask = settings.get("priority_mask") or ""
-    if mask and not os.path.isfile(mask):
-        settings["priority_mask"] = ""
+    for key in ("priority_mask", "height_regions"):
+        mask = settings.get(key) or ""
+        if mask and not os.path.isfile(mask):
+            settings[key] = ""
     # The base is what the result was built on: never picked again.
     settings["auto_background_color"] = False
     settings["optimize_background"] = False

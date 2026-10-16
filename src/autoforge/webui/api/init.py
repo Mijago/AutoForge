@@ -228,6 +228,10 @@ async def run_init(settings: OptimizationSettings):
     # optimizer's loss and plays no part in it. It is also an uploads/ file
     # name here, not a path the pipeline could open.
     settings_dict["priority_mask"] = ""
+    # Nor does the height guidance (it shapes the optimization, not the
+    # starting heights).
+    settings_dict["height_guidance"] = None
+    settings_dict["height_regions"] = ""
 
     box: dict[str, Any] = {}
 

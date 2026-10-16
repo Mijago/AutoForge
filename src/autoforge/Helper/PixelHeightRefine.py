@@ -63,7 +63,36 @@ def _heights_compositor(optimizer, dg, disc_logits, L):
 def _heights_error_fn(optimizer, dg, disc_logits, L, target_lab, weights, smooth):
     """``f(z) -> [H,W]`` per-pixel weighted Lab squared error of heights
     ``z`` under the fixed stack plus ``smooth`` times the height variation;
-    one fused kernel on CUDA."""
+    one fused kernel on CUDA. With height guidance its per-pixel cost is
+    added (same units)."""
+    from autoforge.Helper import FusedComposite as fc
+
+    g = getattr(optimizer, "guidance", None)
+    guided = g is not None and g.has_pixel
+    if guided:
+        # The pull toward the (smooth) target relief already smooths the
+        # map: half the smoothness gives better colour and adherence, and
+        # guided maps stay smoother than unguided ones (results_guidance_loop).
+        smooth = smooth * 0.5
+    if guided and fc.fused_available(optimizer.material_colors):
+        # The pixel cost inside the fused error kernel.
+        from autoforge.Helper.HeightGuidance import PIXEL_TOLERANCE
+
+        tgt, pull = g.maps(tuple(target_lab.shape[:2]))
+        gargs = (tgt, (pull * g.pixel_scale).contiguous(), g._top, PIXEL_TOLERANCE)
+        params = fc.stack_params(dg, optimizer.material_colors, optimizer.material_TDs, optimizer.background, optimizer.h)
+        bg = fc.background_tensor(optimizer.background)
+        tl32 = target_lab.to(torch.float32).contiguous()
+        w32 = weights.to(torch.float32).contiguous()
+        return lambda z: fc.heights_error(z, params, bg, optimizer.h, tl32, w32, smooth, guided=gargs)
+    f = _colour_error_fn(optimizer, dg, disc_logits, L, target_lab, weights, smooth)
+    if not guided:
+        return f
+    return lambda z: f(z) + g.pixel_cost_map(z)
+
+
+def _colour_error_fn(optimizer, dg, disc_logits, L, target_lab, weights, smooth):
+    """``_heights_error_fn`` without the guidance."""
     from autoforge.Helper import FusedComposite as fc
 
     if fc.fused_available(optimizer.material_colors):
@@ -202,6 +231,24 @@ def _keep_heights_if_better(optimizer, new_logits, dg, pre_loss):
 
 
 @composite_graph_scope()
+def _free_heights(optimizer, dg: torch.Tensor, target_lab: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """[H,W] every pixel's free-height optimum under stack ``dg``: the
+    height whose flat stack colour is nearest its target colour - with
+    height guidance, the lowest colour error plus height cost."""
+    L = int(optimizer.max_layers)
+    H, W = target_lab.shape[:2]
+    dev = target_lab.device
+    kk = torch.arange(L + 1, device=dev).view(1, 1, -1)
+    layer = torch.arange(L, device=dev).view(-1, 1, 1)
+    pal = srgb_to_lab(_stack_palette(optimizer, dg.to(torch.long), (layer < kk).float() * optimizer.h))
+    g = getattr(optimizer, "guidance", None)
+    if g is None or not g.has_pixel:
+        return torch.cdist(target_lab.reshape(-1, 3), pal).argmin(dim=1).view(H, W)
+    d2 = torch.cdist(target_lab.reshape(-1, 3), pal).pow(2).view(H, W, -1)
+    d2 = d2 * weights.unsqueeze(-1) + g.pixel_cost_table((H, W), L + 1)
+    return d2.argmin(dim=2)
+
+
 def refine_pixel_heights(
     optimizer,
     sweeps: int = 2,
@@ -287,10 +334,7 @@ def refine_pixel_heights(
         # stack colour is nearest its target colour. Edge bleed is the only
         # thing it ignores, so together with the local window it finds most
         # of what trying every height would, at a fraction of the cost.
-        kk = torch.arange(L + 1, device=z.device).view(1, 1, -1)
-        layer = torch.arange(L, device=z.device).view(-1, 1, 1)
-        pal = srgb_to_lab(_stack_palette(optimizer, dg.to(torch.long), (layer < kk).float() * optimizer.h))
-        pz = torch.cdist(target_lab.reshape(-1, 3), pal).argmin(dim=1).view(H, W)
+        pz = _free_heights(optimizer, dg, target_lab, weights)
 
     total_steps = max(1, sweeps * len(classes))
     done_steps = 0
@@ -443,10 +487,15 @@ def palette_loss_fn(optimizer):
         tl, w = tl[idx], w[idx]
     wsum = w.sum().clamp(min=1e-8)
 
+    g = getattr(optimizer, "guidance", None)
+
     def f(dg):
         pal = srgb_to_lab(_stack_palette(optimizer, dg, eff))  # [L+1,3]
         d = torch.cdist(tl, pal).pow(2)  # [N,L+1]
-        return (d.min(dim=1)[0] * w).sum() / wsum / 3.0
+        loss = (d.min(dim=1)[0] * w).sum() / wsum / 3.0
+        if g is not None and g.has_stack:
+            loss = loss + g.stack_cost(dg, optimizer.base_material, optimizer.background)
+        return loss
 
     return f
 
@@ -665,9 +714,29 @@ class PaletteProxy:
         w = _pixel_weights(optimizer, optimizer.target.shape[:2]).reshape(-1)
         keep = w > 0
         tl, w = tl[keep], w[keep]
+        # With pixel height guidance the pixels are also binned by the
+        # height they are pulled to (and how strongly): a stack then only
+        # scores well if each colour is printed near where its pixels want
+        # to be - the stack search builds depth into the stack instead of
+        # leaving the height assignment to force it at the colour's cost.
+        g = getattr(optimizer, "guidance", None)
+        self._guided = g is not None and g.has_pixel
+        extra = None
+        if self._guided:
+            tgt, wg = g.maps(optimizer.target.shape[:2])
+            tg = tgt.reshape(-1)[keep].float()
+            wgt = wg.reshape(-1)[keep].float()
+            extra = (tg, wgt)
+            max_points *= 4
         size = 1.0
         while True:
             q = torch.round(tl / size).to(torch.int64)
+            if extra is not None:
+                q = torch.cat([
+                    q,
+                    torch.round(extra[0] * 10).to(torch.int64).view(-1, 1),
+                    torch.round(extra[1] * 4).to(torch.int64).view(-1, 1),
+                ], dim=1)
             _, inv, _ = torch.unique(q, dim=0, return_inverse=True, return_counts=True)
             nb = int(inv.max()) + 1
             if nb <= max_points:
@@ -688,6 +757,12 @@ class PaletteProxy:
         w64 = wsum64 / max(wsum64.sum(), 1e-8)
         self.tl = torch.from_numpy(tl64.astype(np.float32)).to(tl.device)
         self.w = torch.from_numpy(w64.astype(np.float32)).to(tl.device)
+        if extra is not None:
+            # Weighted bin means of the target height and the pull.
+            sums = [np.bincount(inv_np, weights=e.cpu().double().numpy() * w_np, minlength=nb) for e in extra]
+            means = [x / np.maximum(wsum64, 1e-12) for x in sums]
+            self._g_t = torch.from_numpy(means[0].astype(np.float32)).to(tl.device)
+            self._g_w = torch.from_numpy(means[1].astype(np.float32)).to(tl.device)
         self.t2 = (self.tl * self.tl).sum(-1)
         self._tl32 = self.tl.to(torch.float32).contiguous()
         self._w32 = self.w.to(torch.float32).contiguous()
@@ -735,13 +810,41 @@ class PaletteProxy:
         return entry["out"].clone()
 
     def _eval(self, dg: torch.Tensor) -> torch.Tensor:
+        out = self._colour_eval(dg)
+        # The height guidance's stack cost (device ops only: this runs
+        # inside the captured graphs too).
+        g = getattr(self.opt, "guidance", None)
+        if g is not None and g.has_stack:
+            out = out + g.stack_cost(dg, getattr(self.opt, "base_material", None), self.opt.background)
+        return out
+
+    def _height_cost(self, n: int) -> torch.Tensor:
+        """[points, n] guidance cost of each point at heights 0..n-1 (Lab
+        squared error units, as HeightGuidance.pixel_cost_map)."""
+        from autoforge.Helper.HeightGuidance import PIXEL_TOLERANCE
+
+        g = self.opt.guidance
+        ks = torch.arange(n, device=self.tl.device, dtype=torch.float32).view(1, -1)
+        dev = torch.clamp((ks / g._top - self._g_t.view(-1, 1)).abs() - PIXEL_TOLERANCE, min=0.0)
+        return g.pixel_scale * self._g_w.view(-1, 1) * dev * dev
+
+    def _colour_eval(self, dg: torch.Tensor) -> torch.Tensor:
         # The palette is a chain of small launch-bound ops: one call for the
         # whole batch. Only the [b, points, heights] distances are chunked.
         pal = self.palette_lab(dg)  # [B,n,3]
         from autoforge.Helper import FusedComposite as fc
 
         if fc.fused_available(pal):
-            return fc.proxy_losses(pal, self._tl32, self._w32)
+            if not self._guided:
+                return fc.proxy_losses(pal, self._tl32, self._w32)
+            from autoforge.Helper.HeightGuidance import PIXEL_TOLERANCE
+
+            g = self.opt.guidance
+            return fc.proxy_losses(
+                pal, self._tl32, self._w32,
+                guided=(self._g_t, self._g_w, g._top, g.pixel_scale, PIXEL_TOLERANCE),
+            )
+        extra = self._height_cost(pal.shape[1]) if self._guided else None
         p2 = (pal * pal).sum(-1)  # [B,n]
         out = []
         for lo in range(0, dg.shape[0], self.chunk):
@@ -752,7 +855,10 @@ class PaletteProxy:
                 p.transpose(1, 2),
                 alpha=-2.0,
             )  # [b,N,n]
-            out.append((d2.min(dim=2)[0].clamp(min=0) * self.w).sum(-1) / 3.0)
+            d2 = d2.clamp(min=0)
+            if extra is not None:
+                d2 = d2 + extra.unsqueeze(0)
+            out.append((d2.min(dim=2)[0] * self.w).sum(-1) / 3.0)
         return torch.cat(out)
 
 
@@ -823,6 +929,15 @@ class _LayerStep:
                 self.fn(self.layer)
             self.graph = g
         self.graph.replay()
+
+
+def _move_band(cur: torch.Tensor, b0: int, ln: int, d: int) -> torch.Tensor:
+    """Stack ``cur`` with its layers ``b0 .. b0+ln-1`` cut out and put back
+    ``d`` layers higher (lower for d < 0), clipped to the stack."""
+    band = cur[b0 : b0 + ln]
+    rest = torch.cat([cur[:b0], cur[b0 + ln :]])
+    at = min(max(0, b0 + d), rest.shape[0])
+    return torch.cat([rest[:at], band, rest[at:]])
 
 
 def search_stack(
@@ -946,6 +1061,11 @@ def search_stack(
                     break
             return st["c"].clone(), st["cl"].clone()
 
+        # With height guidance also band moves: a segment of layers cut out
+        # and put back a few layers higher or lower - a colour moved to
+        # where its pixels are pulled to in one step.
+        g_opt = getattr(optimizer, "guidance", None)
+        n_kinds = 4 if g_opt is not None and g_opt.active else 3
         stall = 0
         for _r in range(rounds):
             if progress is not None:
@@ -955,7 +1075,7 @@ def search_stack(
             lo, hi = max(0, a - 6), min(L, a + 7)
             for _b in range(batch):
                 c = cur.clone()
-                kind = int(torch.randint(0, 3, (1,), generator=g))
+                kind = int(torch.randint(0, n_kinds, (1,), generator=g))
                 m = int(torch.randint(0, M, (1,), generator=g))
                 b0 = int(torch.randint(lo, hi, (1,), generator=g))
                 if kind == 0:
@@ -964,8 +1084,12 @@ def search_stack(
                 elif kind == 1:  # insert m at b0, shift up
                     c[b0 + 1 :] = cur[b0:-1].clone()
                     c[b0] = m
-                else:  # delete b0, shift down, repeat top
+                elif kind == 2:  # delete b0, shift down, repeat top
                     c[b0:-1] = cur[b0 + 1 :].clone()
+                else:  # move the band b0..b0+ln by d layers
+                    ln = int(torch.randint(1, 7, (1,), generator=g))
+                    d = int(torch.randint(-6, 7, (1,), generator=g))
+                    c = _move_band(cur, b0, ln, d)
                 cands.append(c)
             c, cl = descend(torch.stack(cands), lo, hi)
             i = int(torch.argmin(cl))

@@ -92,3 +92,17 @@ def test_env_forced_modes_stay_usable_end_to_end(monkeypatch, mode):
         loss = torch.nn.functional.mse_loss(torch.randn(8, 8) @ w, torch.randn(8, 8))
     loss.backward()
     assert w.grad is not None and torch.isfinite(w.grad).all()
+
+
+@pytest.mark.parametrize("device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else []))
+def test_probe_leaves_the_random_stream_alone(device):
+    """The probe runs once per process, before the first run's optimizer
+    draws its Gumbel noise. Drawing random inputs there shifted the stream
+    of only that first run: the same seed gave a different result in the
+    first webui job than in every later one."""
+    dev = torch.device(device)
+    torch.manual_seed(7)
+    AmpUtils._probe_backward(dev, torch.bfloat16)
+    after_probe = torch.rand(4, device=dev)
+    torch.manual_seed(7)
+    assert torch.equal(after_probe, torch.rand(4, device=dev))

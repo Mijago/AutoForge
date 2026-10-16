@@ -3,7 +3,18 @@ import { createPortal } from 'react-dom'
 import { Minus, Plus } from 'lucide-react'
 import { useAppStore } from '../store/appStore'
 import type { Filament } from '../types'
-import { FULL_HANDLE_SPACING, compactHandleHeight, filterActiveHandles, nearestNeighborGaps } from '../lib/colorStack'
+import {
+  FULL_HANDLE_SPACING,
+  colorCoreLayerAt,
+  colorCoreLayerY,
+  colorCoreTopLayer,
+  compactHandleHeight,
+  filterActiveHandles,
+  getStackSegments,
+  nearestNeighborGaps,
+} from '../lib/colorStack'
+import { effectiveBaseColor } from '../lib/baseColor'
+import { ColorCorePins, PIN_LANE, layerAtPointer, pinFilamentAt } from './ColorCorePins'
 import { getPlanBands } from '../lib/printPlan'
 
 interface HandleData {
@@ -20,19 +31,6 @@ interface SegmentData {
   color: string
   owningHandleIndex: number
   isEquivalent: boolean
-}
-
-function lerpColor(c1: string, c2: string, t: number): string {
-  const r1 = parseInt(c1.slice(1, 3), 16)
-  const g1 = parseInt(c1.slice(3, 5), 16)
-  const b1 = parseInt(c1.slice(5, 7), 16)
-  const r2 = parseInt(c2.slice(1, 3), 16)
-  const g2 = parseInt(c2.slice(3, 5), 16)
-  const b2 = parseInt(c2.slice(5, 7), 16)
-  const r = Math.round(r1 + (r2 - r1) * t)
-  const g = Math.round(g1 + (g2 - g1) * t)
-  const b = Math.round(b1 + (b2 - b1) * t)
-  return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`
 }
 
 /** Black or white, whichever reads better on this background (the label
@@ -65,6 +63,9 @@ export const ColorCore: React.FC = () => {
   const setSelectedBand = useAppStore((s) => s.setSelectedBand)
   const setHoveredBand = useAppStore((s) => s.setHoveredBand)
   const setBottomTab = useAppStore((s) => s.setBottomTab)
+  // Heights mode: the column holds the height guidance's pins; the bands
+  // stay visible for orientation but aren't edited here meanwhile.
+  const heightsMode = useAppStore((s) => s.heightsMode)
   // The scrolling viewport (data-testid="color-core"); `contentRef` is the
   // stack inside it, taller than the viewport when zoomed in.
   const containerRef = useRef<HTMLDivElement>(null)
@@ -80,9 +81,6 @@ export const ColorCore: React.FC = () => {
   // instead means the drag always follows the same band even if its index
   // in that array shifts underneath it.
   const draggingStoreIndexRef = useRef<number | null>(null)
-  // The drag track's vertical scale, frozen for the duration of one drag —
-  // see the effect below.
-  const dragTrackTopLayerRef = useRef<number | null>(null)
   const [hoveredHandle, setHoveredHandle] = useState<number | null>(null)
   const [viewportHeight, setViewportHeight] = useState(300)
   const [zoom, setZoom] = useState(1)
@@ -150,102 +148,37 @@ export const ColorCore: React.FC = () => {
     return new Set(handles.filter((h) => !activeIndices.has(h.storeIndex)).map((h) => h.storeIndex))
   }, [handles, activeHandles])
 
+  // The column's axis: layer 0 (the base) to the heightmap's top layer.
+  const topLayer = colorCoreTopLayer(sliderLayerRange.max, handles.map((h) => h.value))
+  const resolvedBase = useAppStore((s) => s.resolvedBase)
+  const baseColor = effectiveBaseColor(settings, resolvedBase)
+
   const segments: SegmentData[] = useMemo(() => {
-    const handles = activeHandles
-    if (handles.length === 0) return []
-
-    const maxLayer = handles[handles.length - 1].value
-    const result: SegmentData[] = []
-
-    // Rendered top-to-bottom in DOM order, so this must walk from the
-    // highest layer down to 1 — the handles column places the highest
-    // layer at the top (`layerToY` mirrors a physical print: layer 1 at
-    // the bottom), and the segment track has to agree with it. Iterating
-    // ascending here put layer 1 at the top of the DOM instead, so a
-    // handle dragged to a high layer highlighted a band near the *bottom*
-    // of the track instead of near its own arrow.
-    for (let layer = maxLayer; layer >= 1; layer--) {
-      let owningHandleIdx = handles.length - 1
-      for (let h = 0; h < handles.length; h++) {
-        if (layer <= handles[h].value) {
-          owningHandleIdx = h
-          break
-        }
-      }
-
-      let color: string
-      if (owningHandleIdx === 0) {
-        color = handles[0].color
-      } else {
-        const prevHandle = handles[owningHandleIdx - 1]
-        const currHandle = handles[owningHandleIdx]
-        const rangeStart = prevHandle.value
-        const rangeEnd = currHandle.value
-        const t = rangeEnd === rangeStart ? 0 : (layer - rangeStart) / (rangeEnd - rangeStart)
-        color = lerpColor(prevHandle.color, currHandle.color, t)
-      }
-
-      let isEquivalent = false
-      if (layer > 1) {
-        const prevOwningHandleIdx = (() => {
-          for (let h = 0; h < handles.length; h++) {
-            if (layer - 1 <= handles[h].value) {
-              return h
-            }
+    const stack = getStackSegments(activeHandles, topLayer)
+    // Rendered top-to-bottom in DOM order: the highest layer first, layer 1
+    // last (`layerToY` mirrors a physical print, layer 0 at the bottom).
+    return stack
+      .map((seg, i) => {
+        let owningHandleIndex = activeHandles.length - 1
+        for (let h = 0; h < activeHandles.length; h++) {
+          if (seg.layerIndex <= activeHandles[h].value) {
+            owningHandleIndex = h
+            break
           }
-          return handles.length - 1
-        })()
-
-        let prevColor: string
-        if (prevOwningHandleIdx === 0) {
-          prevColor = handles[0].color
-        } else {
-          const prevH = handles[prevOwningHandleIdx - 1]
-          const currH = handles[prevOwningHandleIdx]
-          const rangeStart = prevH.value
-          const rangeEnd = currH.value
-          const t = rangeEnd === rangeStart ? 0 : (layer - 1 - rangeStart) / (rangeEnd - rangeStart)
-          prevColor = lerpColor(prevH.color, currH.color, t)
         }
-
-        if (hexColorsEqual(color, prevColor)) {
-          isEquivalent = true
+        return {
+          layerIndex: seg.layerIndex,
+          color: seg.color,
+          owningHandleIndex,
+          isEquivalent: i > 0 && hexColorsEqual(seg.color, stack[i - 1].color),
         }
-      }
-
-      result.push({
-        layerIndex: layer,
-        color,
-        owningHandleIndex: owningHandleIdx,
-        isEquivalent,
       })
-    }
-
-    return result
-  }, [activeHandles])
-
-  // While dragging, the track's vertical scale is frozen (dragTrackTopLayerRef)
-  // to avoid the "runaway" feedback loop documented on that ref. Rendering
-  // handle/segment positions off the *live* top layer instead — as before —
-  // made the topmost handle visibly detach from the cursor mid-drag (its own
-  // movement kept rescaling the track under it) and reflowed every other
-  // handle even though their layers hadn't changed. Rendering off the same
-  // frozen scale keeps the whole track visually stable for the drag's
-  // duration; it re-syncs to the live top layer as soon as the drag ends.
-  const displayMaxLayer =
-    draggingHandle !== null && dragTrackTopLayerRef.current !== null
-      ? dragTrackTopLayerRef.current
-      : handles.length > 0
-        ? handles[handles.length - 1].value
-        : 0
+      .reverse()
+  }, [activeHandles, topLayer])
 
   const layerToY = useCallback(
-    (layer: number): number => {
-      if (handles.length === 0 || displayMaxLayer === 0) return 0
-      const segmentHeight = containerHeight / displayMaxLayer
-      return segmentHeight * (displayMaxLayer - layer) + segmentHeight / 2
-    },
-    [handles, containerHeight, displayMaxLayer],
+    (layer: number): number => colorCoreLayerY(layer, topLayer, containerHeight),
+    [topLayer, containerHeight],
   )
 
   /** Pointing at a handle selects its band everywhere (row, strip, 3D). */
@@ -320,8 +253,6 @@ export const ColorCore: React.FC = () => {
 
   useEffect(() => {
     if (draggingHandle === null) {
-      // Reset so the next drag captures a fresh value at its own start.
-      dragTrackTopLayerRef.current = null
       draggingStoreIndexRef.current = null
       return
     }
@@ -352,28 +283,12 @@ export const ColorCore: React.FC = () => {
     const minLayer = prevHandle ? prevHandle.layer : 1
     const maxLayer = nextHandle ? nextHandle.layer : sliderLayerRange.max
 
-    // The vertical scale of the drag track is fixed once, at the start of
-    // this drag — not recomputed from the live `colorSliders` on every one
-    // of this effect's re-runs (which `updateSlider` below triggers, since
-    // colorSliders is a dependency). For every handle but the topmost, that
-    // recomputed value happens to equal the frozen one anyway (a neighbor's
-    // layer doesn't move during this drag). For the topmost handle it does
-    // NOT: `activeSliders[last]` *is* the handle being dragged, so its
-    // "scale" changed on the previous update — shrinking the denominator as
-    // the handle rose, which made the next mousemove event (same pixel
-    // delta) compute a larger layer jump than the last one, and the handle
-    // ran away toward the layer max within a few pixels of jitter.
-    if (dragTrackTopLayerRef.current === null) {
-      dragTrackTopLayerRef.current = activeSliders[activeSliders.length - 1].layer
-    }
-    const currentMaxLayer = dragTrackTopLayerRef.current
-
     const handleMove = (clientY: number) => {
       if (!contentRef.current) return
       const rect = contentRef.current.getBoundingClientRect()
-      const relativeY = clientY - rect.top
-      const segmentHeight = rect.height / currentMaxLayer
-      const rawLayer = Math.round((rect.height - relativeY) / segmentHeight)
+      // The axis no longer depends on the bands (it is the heightmap's
+      // top), so a dragged top band can't rescale the track under itself.
+      const rawLayer = colorCoreLayerAt(rect.bottom - clientY, topLayer, rect.height)
       const clampedLayer = Math.max(minLayer, Math.min(maxLayer, Math.max(1, rawLayer)))
       if (clampedLayer !== handle.layer) {
         updateSlider(handle.storeIndex, { layer: clampedLayer })
@@ -405,13 +320,21 @@ export const ColorCore: React.FC = () => {
       window.removeEventListener('touchmove', onTouchMove)
       window.removeEventListener('touchend', onEnd)
     }
-  }, [draggingHandle, colorSliders, updateSlider, sliderLayerRange.max])
+  }, [draggingHandle, colorSliders, updateSlider, sliderLayerRange.max, topLayer])
 
   const handleDrop = useCallback(
     (e: React.DragEvent) => {
       e.preventDefault()
       try {
         const filament: Filament = JSON.parse(e.dataTransfer.getData('application/json'))
+        if (heightsMode) {
+          // A pin at the height it was dropped at.
+          if (!activeFilaments.some((f) => f.uuid === filament.uuid)) addActiveFilament(filament)
+          const column = contentRef.current
+          const layer = column ? layerAtPointer(column, e.clientY, topLayer) : Math.round(topLayer / 2)
+          pinFilamentAt(filament.uuid, layer, topLayer, filament.name)
+          return
+        }
         // Mirror addBand's own criterion for a reusable column: disabled AND
         // never positioned. A disabled column that still has a layer is a
         // deliberately hidden (eye-off) band — reusing it here clobbered its
@@ -433,15 +356,13 @@ export const ColorCore: React.FC = () => {
         // ignore
       }
     },
-    [colorSliders, updateSlider, addActiveFilament, activeFilaments, sliderLayerRange.max],
+    [colorSliders, updateSlider, addActiveFilament, activeFilaments, sliderLayerRange.max, heightsMode, topLayer],
   )
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault()
     e.dataTransfer.dropEffect = 'copy'
   }, [])
-
-  const maxLayer = displayMaxLayer
 
   // Hover shows the tooltip; so do keyboard focus and dragging.
   const tipIndex = draggingHandle ?? hoveredHandle ?? focusedHandle
@@ -473,13 +394,19 @@ export const ColorCore: React.FC = () => {
         borderRadius: 4,
         backgroundColor: 'var(--bg-panel)',
         height: '100%',
-        width: 80,
+        // Heights mode adds the pins' lane right of the track.
+        width: heightsMode ? 80 + PIN_LANE : 80,
         overflow: 'hidden',
         display: 'flex',
         flexDirection: 'column',
       }}
     >
-      {handles.length > 0 && (
+      {heightsMode && (
+        <div className="px-1 py-0.5 border-b border-cyan-700 bg-cyan-900/30 text-[10px] leading-tight text-cyan-200 flex-shrink-0" title="Drag a filament from the library onto the column to pin it at a height, or click a band to pin its filament there. Pins are suggestions: the optimizer keeps a band of that filament roughly there." data-testid="color-core-pins-hint">
+          Drop filaments to pin
+        </div>
+      )}
+      {(handles.length > 0 || heightsMode) && (
         <div className="flex items-center justify-between px-0.5 border-b border-gray-700 flex-shrink-0" title="Zoom the color column (Ctrl+scroll)">
           <button onClick={() => setZoom((z) => Math.max(MIN_ZOOM, z / 1.5))} disabled={zoom <= MIN_ZOOM} className={zoomButton} aria-label="Zoom out the color column" data-testid="color-core-zoom-out">
             <Minus className="w-3 h-3" />
@@ -503,13 +430,15 @@ export const ColorCore: React.FC = () => {
         ref={containerRef}
         className={`flex-1 relative ${zoom > 1 ? 'overflow-y-auto overflow-x-hidden' : 'overflow-hidden'}`}
         data-testid="color-core"
+        data-top-layer={topLayer}
         onDrop={handleDrop}
         onDragOver={handleDragOver}
       >
-        {handles.length > 0 ? (
-          <div ref={contentRef} className="relative flex" style={{ height: containerHeight }}>
+        {handles.length > 0 || heightsMode ? (
+          <div ref={contentRef} className="relative flex" style={{ height: containerHeight }} data-heights-mode={heightsMode || undefined}>
+            {heightsMode && <ColorCorePins topLayer={topLayer} height={containerHeight} columnRef={contentRef} />}
             {/* Handles (arrowheads on the left) */}
-            <div className="relative w-14 flex-shrink-0 z-20" data-testid="color-core-handles">
+            <div className={`relative w-14 flex-shrink-0 z-20 ${heightsMode ? 'opacity-30 pointer-events-none' : ''}`} data-testid="color-core-handles">
               {/* Slider rail */}
               <div className="absolute right-1 top-0 bottom-0 w-0.5 bg-white/15" />
               {handles.map((handle, idx) => {
@@ -540,7 +469,7 @@ export const ColorCore: React.FC = () => {
                     aria-valuenow={handle.value}
                     aria-valuemin={1}
                     aria-valuemax={sliderLayerRange.max}
-                    className={`absolute flex items-center cursor-grab active:cursor-grabbing select-none outline-none ${compact ? 'right-1.5' : 'left-0'}`}
+                    className={`absolute flex items-center cursor-grab active:cursor-grabbing select-none outline-none ${compact ? 'right-1.5' : 'right-0'}`}
                     style={{ top: `${yPos}px`, transform: 'translateY(-50%)', opacity: isOverlapDisabled ? 0.45 : 1, zIndex: active ? 30 : undefined, touchAction: 'none' }}
                     onMouseDown={handleMouseDown(idx)}
                     onMouseEnter={() => {
@@ -557,6 +486,7 @@ export const ColorCore: React.FC = () => {
                     onTouchStart={handleTouchStart(idx)}
                     data-testid={`color-core-handle-${idx}`}
                     data-layer={handle.value}
+                    data-above-top={handle.value > topLayer || undefined}
                     data-selected={handle.storeIndex === selectedBand || undefined}
                     data-overlap-disabled={isOverlapDisabled || undefined}
                     data-compact={compact || undefined}
@@ -594,11 +524,26 @@ export const ColorCore: React.FC = () => {
             {/* Segments (track) */}
             <div
               ref={trackRef}
-              className="flex-1 relative overflow-hidden"
+              className={`flex-1 relative overflow-hidden ${heightsMode ? 'cursor-copy' : ''}`}
               data-testid="color-core-segments"
+              onClick={
+                heightsMode
+                  ? (e) => {
+                      // Pin the clicked band's filament where it was clicked.
+                      const column = contentRef.current
+                      if (!column) return
+                      const layer = layerAtPointer(column, e.clientY, topLayer)
+                      const seg = segments.find((sg) => sg.layerIndex === layer)
+                      const owner = seg ? activeHandles[seg.owningHandleIndex] : undefined
+                      if (!owner) return
+                      const f = [...activeFilaments, ...filaments].find((x) => x.uuid === owner.filamentUuid)
+                      if (owner.filamentUuid) pinFilamentAt(owner.filamentUuid, layer, topLayer, f?.name)
+                    }
+                  : undefined
+              }
             >
               {segments.map((segment, idx) => {
-                const segmentHeight = containerHeight / maxLayer
+                const segmentHeight = containerHeight / (topLayer + 1)
                 return (
                   <div
                     key={segment.layerIndex}
@@ -621,11 +566,25 @@ export const ColorCore: React.FC = () => {
                   </div>
                 )
               })}
+              {/* Layer 0: the base the color layers are printed on. */}
+              <div
+                className="w-full relative"
+                style={{
+                  backgroundColor: baseColor,
+                  height: `${containerHeight / (topLayer + 1)}px`,
+                  boxShadow: 'inset 0 1px 0 rgba(0,0,0,0.5)',
+                }}
+                title="Base (layer 0)"
+                data-testid="color-core-base"
+                data-layer={0}
+                data-color={baseColor}
+              />
             </div>
 
             {/* Connectors (SVG overlay on the right) */}
             <svg
               className="absolute right-0 top-0 h-full w-4 pointer-events-none z-10"
+              style={heightsMode ? { right: PIN_LANE } : undefined}
               data-testid="color-core-connectors"
             >
               {handles.map((handle, idx) => {
@@ -669,6 +628,7 @@ export const ColorCore: React.FC = () => {
                 )
               })}
             </svg>
+            {heightsMode && <div className="flex-shrink-0 bg-gray-900/60 border-l border-cyan-800" style={{ width: PIN_LANE }} data-testid="color-core-pin-lane" />}
           </div>
         ) : (
           <div className="h-full flex items-center justify-center text-center px-1.5 text-[11px] leading-snug text-gray-400" data-testid="color-core-empty">

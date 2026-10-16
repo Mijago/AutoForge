@@ -50,7 +50,7 @@ export function getStackHandles(colorSliders: ColorSliderConfig[], filaments: Fi
  * that print layer for coloring/compositing purposes. When two or more
  * handles land on the same layer, the one further right in the column order
  * (the highest `storeIndex`) wins; the rest are silently excluded here. */
-export function filterActiveHandles(handles: StackHandle[]): StackHandle[] {
+export function filterActiveHandles<T extends StackHandle>(handles: T[]): T[] {
   const winnerByValue = new Map<number, number>()
   for (const h of handles) {
     const current = winnerByValue.get(h.value)
@@ -69,11 +69,13 @@ export function getOverlapDisabledIndices(colorSliders: ColorSliderConfig[], fil
   return new Set(handles.filter((h) => !activeIndices.has(h.storeIndex)).map((h) => h.storeIndex))
 }
 
-/** One entry per print layer (1..maxLayer), color-blended between the
- * handle below and at each layer — same interpolation ColorCore uses. */
-export function getStackSegments(handles: StackHandle[]): StackSegment[] {
+/** One entry per print layer (1..topLayer, by default the top band's
+ * layer), color-blended between the handle below and at each layer — same
+ * interpolation ColorCore uses. Layers above the top band keep its color,
+ * as they print. */
+export function getStackSegments(handles: StackHandle[], topLayer?: number): StackSegment[] {
   if (handles.length === 0) return []
-  const maxLayer = handles[handles.length - 1].value
+  const maxLayer = topLayer ?? handles[handles.length - 1].value
   const result: StackSegment[] = []
 
   for (let layer = 1; layer <= maxLayer; layer++) {
@@ -88,6 +90,8 @@ export function getStackSegments(handles: StackHandle[]): StackSegment[] {
     let color: string
     if (owningHandleIdx === 0) {
       color = handles[0].color
+    } else if (layer > handles[handles.length - 1].value) {
+      color = handles[handles.length - 1].color
     } else {
       const prevHandle = handles[owningHandleIdx - 1]
       const currHandle = handles[owningHandleIdx]
@@ -101,6 +105,34 @@ export function getStackSegments(handles: StackHandle[]): StackSegment[] {
   }
 
   return result
+}
+
+/** Top of the color column's axis. The column always runs from layer 0 (the
+ * base) to the top layer of the current heightmap (`rangeMax`: the auto
+ * preview's, the run's or the prune's — `max_layers` before there is one),
+ * not to the highest band: a top band ending below the print's top still
+ * colors every layer above it, and one ending above the top is never
+ * printed. Without a usable range the highest band is the top. */
+export function colorCoreTopLayer(rangeMax: number, handleValues: number[]): number {
+  if (Number.isFinite(rangeMax) && rangeMax > 0) return Math.round(rangeMax)
+  return Math.max(1, ...handleValues.filter((v) => Number.isFinite(v)))
+}
+
+/** Vertical center (px from the column's top) of print layer `layer` on an
+ * axis of layers 0..`topLayer` drawn `height` px tall. Layers outside the
+ * axis sit at its ends. */
+export function colorCoreLayerY(layer: number, topLayer: number, height: number): number {
+  const rows = Math.max(1, topLayer + 1)
+  const row = height / rows
+  const clamped = Math.max(0, Math.min(topLayer, layer))
+  return row * (topLayer - clamped) + row / 2
+}
+
+/** The print layer under a point `fromBottom` px above the bottom of a
+ * column of layers 0..`topLayer` drawn `height` px tall. */
+export function colorCoreLayerAt(fromBottom: number, topLayer: number, height: number): number {
+  const rows = Math.max(1, topLayer + 1)
+  return Math.max(0, Math.min(topLayer, Math.floor(fromBottom / (height / rows))))
 }
 
 /** Pixel height a full color-column handle (arrow plus layer number) needs

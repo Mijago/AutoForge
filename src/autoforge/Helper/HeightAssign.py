@@ -82,11 +82,13 @@ def assign_heights(
     sweeps: int = 6,
     weights: torch.Tensor = None,
     target_lab: torch.Tensor = None,
+    extra_cost: torch.Tensor = None,
 ) -> torch.Tensor:
     """ICM height assignment. ``colors`` [K,3] (0-255) are the stack colours
     per height, ``target`` [H,W,3] (0-255), ``z0`` [H,W] the starting
     heights (None: the colour-only optimum). Returns int64 [H,W] heights in
-    0..K-1.
+    0..K-1. ``extra_cost`` [H,W,K] (optional, Lab squared error units) is
+    added to every pixel's cost per height (the height guidance).
 
     Both sides of every edge are charged (``2 * smooth``), as when the
     per-pixel costs are summed over each pixel's 3x3 window in the refine."""
@@ -98,6 +100,9 @@ def assign_heights(
     err = torch.cdist(target_lab.view(-1, 3), c_lab).pow(2).view(H, W, K)  # Lab SSE
     if weights is not None:
         err = err * weights.unsqueeze(-1)
+    if extra_cost is not None:
+        # In place: at the output resolution [H,W,K] is the largest tensor here.
+        err.add_(extra_cost)
     if z0 is None or smooth <= 0:
         z = err.argmin(-1)
         if smooth <= 0:

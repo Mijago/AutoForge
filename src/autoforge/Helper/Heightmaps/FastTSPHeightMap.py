@@ -268,6 +268,7 @@ def init_height_map(
     overcluster_seed: int = 0,
     target_lab: Optional[np.ndarray] = None,
     rank_quality: bool = True,
+    height_target=None,
 ):
     """Initialize pixel height logits using MST-Path + 2-Opt ordering.
 
@@ -340,6 +341,23 @@ def init_height_map(
     final_ordering = tsp_order_mst_path(nodes, labs, bg_cluster, fg_cluster)
 
     new_values = create_mapping(final_ordering, labs, unique_clusters)
+    if height_target is not None:
+        # Height guidance: order the clusters by the mean target height of
+        # their pixels instead of by colour, so the starting stack already
+        # prints every colour where its pixels are pulled to (the layer
+        # order follows these values). A cluster only partly guided moves
+        # that far from its colour-order value.
+        tgt, wgt = height_target
+        flat = labels.reshape(-1)
+        n = int(flat.max()) + 1
+        cnt = np.bincount(flat, minlength=n).astype(np.float64)
+        wsum = np.bincount(flat, weights=wgt.reshape(-1).astype(np.float64), minlength=n)
+        tsum = np.bincount(flat, weights=(tgt * wgt).reshape(-1).astype(np.float64), minlength=n)
+        for label in unique_clusters:
+            if wsum[label] > 0:
+                mix = min(1.0, wsum[label] / cnt[label])
+                new_values[label] = (1.0 - mix) * new_values[label] + mix * float(tsum[label] / wsum[label])
+
     # `new_values` only has ~cluster_layers entries (unique_clusters), but
     # np.vectorize(lambda x: new_values[x])(labels) called that Python
     # lambda once per *pixel* (profiling showed this as the single biggest
@@ -443,6 +461,7 @@ def run_init_threads(
     focus_map: Optional[np.ndarray] = None,
     focus_boost: float = 0.5,
     progress=None,
+    height_target=None,
 ):
     background_tuple = (np.asarray(background_tuple) * 255).tolist()
     if num_runs > 1:
@@ -480,6 +499,7 @@ def run_init_threads(
             overcluster_seed=seed_offset,
             target_lab=pixels,
             rank_quality=num_runs > 1,
+            height_target=height_target,
         )
 
     if num_threads > 1 and num_runs > 1:

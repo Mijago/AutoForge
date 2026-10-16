@@ -56,6 +56,7 @@ def _no_filamentcolors_network():
 
     mp = pytest.MonkeyPatch()
     mp.setattr(config, "filamentcolors_auto_update", False)
+    mp.setattr(config, "preload_depth_model", False)
     yield
     mp.undo()
 

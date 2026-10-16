@@ -34,6 +34,31 @@ _gpu_lock = threading.Lock()
 LAYER_CHUNK = 25
 
 
+def _guidance(optimizer, dg: torch.Tensor, z, top=None):
+    """The optimizer's height guidance cost of stack(s) ``dg`` at heights
+    ``z`` (see FilamentOptimizer.guidance_cost), or None."""
+    f = getattr(optimizer, "guidance_cost", None)
+    return f(dg, z, top) if f is not None else None
+
+
+def _best_heights(optimizer) -> torch.Tensor:
+    """[H,W] whole-layer heights of the best solution."""
+    bp = optimizer.best_params
+    return _heights_from_logits(
+        optimizer._apply_height_offset(bp["pixel_height_logits"], bp["height_offsets"]),
+        optimizer.max_layers, optimizer.h, optimizer.vis_tau,
+    )
+
+
+def _with_guidance(optimizer, loss: torch.Tensor, dg: torch.Tensor) -> torch.Tensor:
+    """``loss`` of stack ``dg`` at the best heights plus the height
+    guidance's cost of that solution (unchanged without guidance)."""
+    if getattr(optimizer, "guidance", None) is None:
+        return loss
+    gc = _guidance(optimizer, dg.to(torch.long), _best_heights(optimizer))
+    return loss if gc is None else loss + gc
+
+
 def _heights_from_logits(
     eff_logits: torch.Tensor, max_layers: int, h: float, vis_tau: float
 ) -> torch.Tensor:
@@ -410,6 +435,8 @@ def candidate_losses(
         )
         del gl_batch
         z = getattr(eff_thick, "_af_z", None)
+        with torch.no_grad():
+            gc = _guidance(optimizer, dg_batch, z)
         if z is not None:
             from autoforge.Helper import FusedComposite as fc
 
@@ -417,12 +444,16 @@ def candidate_losses(
                 # The whole chunk in one fused pass (the same loss per
                 # candidate as _candidate_loss's).
                 with _gpu_lock, torch.no_grad():
-                    losses.append(fc.batched_heights_loss(optimizer, z, cols, tds))
+                    chunk_losses = fc.batched_heights_loss(optimizer, z, cols, tds)
+                losses.append(chunk_losses if gc is None else chunk_losses + gc)
                 continue
         # Composite + loss per candidate — iterative, no [B, L, H, W]
+        chunk_losses = []
         for b in range(len(chunk)):
             with _gpu_lock, torch.no_grad():
-                losses.append(_candidate_loss(optimizer, eff_thick, cols[b], tds[b])[None])
+                chunk_losses.append(_candidate_loss(optimizer, eff_thick, cols[b], tds[b])[None])
+        chunk_losses = torch.cat(chunk_losses)
+        losses.append(chunk_losses if gc is None else chunk_losses + gc)
     return torch.cat(losses)
 
 
@@ -520,6 +551,7 @@ def prune_num_colors(
                 custom_global_logits=logits_for_disc
             )
             loss = compute_loss(comp=out_im, target=optimizer.target, focus_map=optimizer.focus_map, alpha=optimizer.alpha)
+            loss = _with_guidance(optimizer, loss, dg_test)
 
         return loss, dg_test
 
@@ -531,6 +563,7 @@ def prune_num_colors(
                 custom_global_logits=logits_for_disc
             )
             loss = compute_loss(comp=out_im, target=optimizer.target, focus_map=optimizer.focus_map, alpha=optimizer.alpha)
+            loss = _with_guidance(optimizer, loss, dg_test)
 
         return loss
 
@@ -719,6 +752,7 @@ def prune_num_swaps(
                 custom_global_logits=logits_for_disc
             )
             loss = compute_loss(comp=out_im, target=optimizer.target, focus_map=optimizer.focus_map, alpha=optimizer.alpha)
+            loss = _with_guidance(optimizer, loss, dg_test)
         return loss
 
     def score_swap(dg_base: torch.Tensor, band_a, band_b, direction: str):
@@ -729,6 +763,7 @@ def prune_num_swaps(
                 custom_global_logits=logits_for_disc
             )
             loss = compute_loss(comp=out_im, target=optimizer.target, focus_map=optimizer.focus_map, alpha=optimizer.alpha)
+            loss = _with_guidance(optimizer, loss, dg_test)
         return loss, dg_test
 
     best_dg = disc_global.clone()
@@ -1066,8 +1101,18 @@ def prune_redundant_layers(
         scorer for both: the baseline used to come from the bf16 composite
         while the candidates were scored in fp32)."""
         with _gpu_lock, torch.no_grad():
+            if getattr(optimizer, "guidance", None) is not None:
+                # A removal lowers everything above the layer: each
+                # candidate is judged against its own top.
+                z = _heights_from_logits(eff_logits, n_layers, optimizer.h, optimizer.vis_tau)
+                seed = optimizer.best_seed if optimizer.best_seed is not None and optimizer.best_seed >= 0 else 0
+                sel = batched_layer_material_indices(global_logits, optimizer.vis_tau, seed)
+                gc = _guidance(optimizer, sel, z, top=z.max().clamp(min=1).float())
+            else:
+                gc = None
             if use_fused:
-                return float(_fused_logits_loss(optimizer, eff_logits, global_logits, n_layers))
+                loss = _fused_logits_loss(optimizer, eff_logits, global_logits, n_layers)
+                return float(loss if gc is None else loss + gc)
             comp = composite_image_disc(
                 eff_logits,
                 global_logits,
@@ -1080,7 +1125,8 @@ def prune_redundant_layers(
                 optimizer.background,
                 rng_seed=optimizer.best_seed,
             )
-            return compute_loss(comp, optimizer.target, focus_map=optimizer.focus_map, alpha=optimizer.alpha).item()
+            loss = compute_loss(comp, optimizer.target, focus_map=optimizer.focus_map, alpha=optimizer.alpha)
+            return (loss if gc is None else loss + gc).item()
 
     best_loss = _logits_loss(
         optimizer.best_params["pixel_height_logits"] + shared_height_offset,
@@ -1313,9 +1359,17 @@ def _removal_losses_fused(optimizer, chunk, current_max_layers, eff, disc_height
                 batched_layer_material_indices(torch.cat([gl[:i], gl[i + 1:]], dim=0), optimizer.vis_tau, seed)
                 for i in idx
             ])
-            out += fc.batched_heights_loss(
+            losses = fc.batched_heights_loss(
                 optimizer, z, optimizer.material_colors[sel], optimizer.material_TDs[sel].clamp(1e-8, 1e8)
-            ).tolist()
+            )
+            if getattr(optimizer, "guidance", None) is not None:
+                # Each candidate against its own top (see prune_redundant_layers).
+                g = optimizer.guidance
+                tops = z.amax(dim=(1, 2)).clamp(min=1).float()
+                losses = losses + g.stack_cost(sel, optimizer.base_material, optimizer.background, top=tops)
+                if g.has_pixel:
+                    losses = losses + g.pixel_loss(z, top=tops)
+            out += losses.tolist()
     return out
 
 
@@ -1698,9 +1752,11 @@ def _compute_loss_for_heightmap(
                 optimizer.max_layers, optimizer.h, optimizer.vis_tau,
             )
             d = disc_global.to(torch.long)
-            return float(fc.heights_loss(
+            loss = fc.heights_loss(
                 optimizer, z, optimizer.material_colors[d], optimizer.material_TDs[d].clamp(1e-8, 1e8)
-            ))
+            )
+            gc = _guidance(optimizer, d, z)
+            return float(loss if gc is None else loss + gc)
     logits_for_disc = disc_to_logits(
         disc_global, optimizer.material_colors.shape[0], big_pos=1e5
     )
@@ -1709,7 +1765,17 @@ def _compute_loss_for_heightmap(
             custom_height_logits=custom_height_logits,
             custom_global_logits=logits_for_disc,
         )
-        return compute_loss(comp=out_im, target=optimizer.target, focus_map=optimizer.focus_map, alpha=optimizer.alpha).item()
+        loss = compute_loss(comp=out_im, target=optimizer.target, focus_map=optimizer.focus_map, alpha=optimizer.alpha)
+        if getattr(optimizer, "guidance", None) is not None:
+            bp = optimizer.best_params
+            eff = custom_height_logits if custom_height_logits is not None else optimizer._apply_height_offset(
+                bp["pixel_height_logits"], bp["height_offsets"]
+            )
+            z = _heights_from_logits(eff, optimizer.max_layers, optimizer.h, optimizer.vis_tau)
+            gc = _guidance(optimizer, disc_global.to(torch.long), z)
+            if gc is not None:
+                loss = loss + gc
+        return loss.item()
 
 
 def remove_height_spikes(

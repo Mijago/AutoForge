@@ -19,7 +19,7 @@ from ..helpers.result_store import (
     save_solution,
     solution_from_sliders,
 )
-from ..helpers.sliders import result_counts_from_optimizer, should_repeat_prune
+from ..helpers.sliders import guidance_report_from_optimizer, result_counts_from_optimizer, should_repeat_prune
 from ..helpers.telemetry import capture_exception
 from ..config import config
 from .workers import STILL_STOPPING, running_worker, start_worker, wait_until_idle
@@ -63,8 +63,9 @@ def _init_solution(settings: PruningSettings) -> dict:
     if image_path is None:
         raise HTTPException(404, f"Input image not found: {run_settings.input_image}")
     settings_dict = run_settings.model_dump()
-    mask = settings_dict.get("priority_mask") or ""
-    settings_dict["priority_mask"] = (get_image_service().get_path(mask) or "") if mask else ""
+    for key in ("priority_mask", "height_regions"):
+        mask = settings_dict.get(key) or ""
+        settings_dict[key] = (get_image_service().get_path(mask) or "") if mask else ""
     try:
         solution = solution_from_sliders(
             heights.detach().cpu().numpy().astype(np.int64),
@@ -93,6 +94,10 @@ async def start_pruning(settings: PruningSettings):
     # so this is a hard mutex, not a recommendation. A double-click on
     # "Start pruning" used to start a second prune thread on the same
     # result.
+    from ..helpers.guidance_views import QUICK_PREVIEW_BUSY, quick_preview_running
+
+    if quick_preview_running():
+        raise HTTPException(409, QUICK_PREVIEW_BUSY)
     busy = svc.get_any_active_job()
     if busy is not None:
         if busy.job_id.startswith("prune-"):
@@ -800,9 +805,14 @@ async def start_pruning(settings: PruningSettings):
                     save_solution(output_dir, pipeline_result)
                 except Exception as e:
                     capture_exception(e, {"phase": "save_solution", "job_id": prune_job_id})
+                try:
+                    guidance = guidance_report_from_optimizer(optimizer)
+                except Exception:
+                    guidance = None
                 if not svc.complete_prune(
                     prune_job_id, job_id, progress=100.0, phase=None,
                     **_live_counts(), **_pass_fields(),
+                    **({"guidance_report": guidance} if guidance is not None else {}),
                     **({"auto_outcome": auto_result.get("auto_outcome"), "loss": auto_result.get("loss")} if auto else {}),
                 ):
                     # Cancelled in the last moment: the frontend stays on

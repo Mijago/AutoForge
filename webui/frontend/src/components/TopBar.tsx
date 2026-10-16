@@ -34,6 +34,7 @@ import { describePruningChange, resultCounts } from '../lib/pruning'
 import { effectiveBaseFilamentUuid } from '../lib/baseColor'
 import { onUiCommand, sendUiCommand, type UiCommand } from '../lib/uiEvents'
 import { useFlash } from '../hooks/usePersistentState'
+import { describeReportPins, summarizeReport } from '../lib/heightGuidance'
 
 interface UpdateInfo {
   current_version: string
@@ -351,6 +352,10 @@ const ResultStatus: React.FC = () => {
   const stale = reasons.length > 0
   const pruned = pruningJob?.status === 'completed'
   const pruneCancelled = pruningJob?.status === 'cancelled'
+  // How the result follows the height guidance: the prune's report once a
+  // prune finished, else the run's.
+  const guidanceReport = (pruned ? pruningJob?.guidance_report : null) ?? currentJob?.guidance_report ?? null
+  const guidanceSummary = summarizeReport(guidanceReport)
 
   return (
     <div
@@ -383,6 +388,21 @@ const ResultStatus: React.FC = () => {
         >
           <span aria-hidden className="text-gray-500">· </span>
           {counts.colors} colors · {counts.swaps} {counts.swaps === 1 ? 'swap' : 'swaps'}
+        </span>
+      )}
+      {guidanceSummary && guidanceReport && (
+        <span
+          className={`text-xs tabular-nums ${guidanceSummary.followed < guidanceSummary.total ? 'text-amber-500' : 'text-gray-300'}`}
+          title={[
+            'How this result follows your height suggestions (a suggestion is followed when a band of the filament is near its pin):',
+            ...describeReportPins(guidanceReport, (uuid) => activeFilaments.find((f) => f.uuid === uuid)?.name ?? 'Filament'),
+          ].join('\n')}
+          data-testid="result-guidance"
+          data-followed={guidanceSummary.followed}
+          data-total={guidanceSummary.total}
+        >
+          <span aria-hidden className="text-gray-500">· </span>
+          Heights {guidanceSummary.text}
         </span>
       )}
       {pruned && (

@@ -247,6 +247,10 @@ class FilamentOptimizer:
 
         self.preview_callback = preview_callback
         self.preview_callback_interval = preview_callback_interval
+        # Height guidance (HeightGuidance): soft suggestions where colours
+        # sit in the print, added to every loss the run optimizes. Set by
+        # the caller after construction; None leaves every loss as it was.
+        self.guidance = None
         # Called as prune_step_callback(optimizer, step_name) each time a
         # pruning step has finished and its result is in best_params (the
         # webui refreshes its 3D preview from it).
@@ -696,7 +700,7 @@ class FilamentOptimizer:
                 new = search_stack(
                     self, max_colors, max_swaps,
                     rounds=int(getattr(args, "intermediate_search_rounds", 15)),
-                    patience=int(getattr(args, "intermediate_search_patience", 5)),
+                    patience=int(getattr(args, "intermediate_search_patience", 5)) * (2 if self.guidance is not None else 1),
                     seed=self.num_steps_done + k, init_dg=start, verbose=False,
                 )
                 cur, _ = self.get_discretized_solution(best=True)
@@ -763,6 +767,9 @@ class FilamentOptimizer:
                 self.material_TDs, rng_seed=self.best_seed, tau=self.vis_tau,
             )
             loss = _candidate_loss(self, eff, cols, tds)
+        gc = self.guidance_cost(dg, getattr(eff, "_af_z", None))
+        if gc is not None:
+            loss = loss + gc
         return float(loss)
 
     @composite_graph_scope()
@@ -949,9 +956,14 @@ class FilamentOptimizer:
         # from the current map - it only finds local optima, and from the
         # current (or, at output resolution, the upsampled) map it keeps its
         # blocks.
+        g = self.guidance
+        extra = g.pixel_cost_table(tuple(z0.shape), L + 1) if g is not None else None
+        # The depth targets are smooth already: guided assignments need less
+        # smoothing of their own (measured: half keeps the adherence and
+        # costs less colour).
         z = assign_heights(
-            colors, self.target, None, smooth=self.height_assign_smooth, weights=w,
-            target_lab=target_lab,
+            colors, self.target, None, smooth=self.height_assign_smooth * (0.5 if extra is not None else 1.0), weights=w,
+            target_lab=target_lab, extra_cost=extra,
         )
         if keep_empty is not None:
             z = torch.where(keep_empty, z0.to(z.dtype), z)
@@ -975,6 +987,9 @@ class FilamentOptimizer:
         z = self.assigned_heights(dg, eff, background=bg)
         new_eff = heights_to_logits(z, self.max_layers)
         self.pixel_height_logits.copy_(new_eff - (eff - self.pixel_height_logits))
+        if self.guidance is not None:
+            # Pins and targets are fractions of the print's height.
+            self.guidance.sync_top(z)
 
     def _gather_offsets(self, offsets_1d: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         """``offsets_1d[labels]`` whose backward sums in a fixed order (the
@@ -1077,11 +1092,26 @@ class FilamentOptimizer:
             self._viol.copy_(excess.detach())
             loss = loss + self._lagr_gate * (self._lam * excess).sum()
 
+        g = self.guidance
+        if g is not None and g.has_stack:
+            bg_probs = torch.softmax(self.bg_logits, dim=0) if self.bg_logits is not None else None
+            loss = loss + g.stack_cost_soft(
+                self.params["global_logits"], bg_probs, self.base_material, self.background
+            )
+
         if self.precision.scaler is not None:
             self.precision.scaler.scale(loss).backward()
         else:
             loss.backward()
         return loss
+
+    def guidance_cost(self, dg: torch.Tensor, z: Optional[torch.Tensor], top=None) -> Optional[torch.Tensor]:
+        """The height guidance's cost of stack(s) ``dg`` at heights ``z``
+        (loss units, on the device), or None without guidance."""
+        g = self.guidance
+        if g is None or not g.active:
+            return None
+        return g.total(dg, z, self.base_material, self.background, top)
 
     def _unfused_loss(self, tau_height: float, tau_global: float):
         """The step's image loss through loss_fn (see _fused_height_loss)."""
@@ -2166,6 +2196,9 @@ class FilamentOptimizer:
         # output resolution — so "never regress below start_loss" was
         # comparing against a number from a different image size.
         dg, dh = self.get_discretized_solution(best=True)
+        if self.guidance is not None and dh is not None:
+            # Guidance positions are fractions of the height being pruned.
+            self.guidance.sync_top(dh)
         current_loss = (
             _compute_loss_for_heightmap(self, dg) if dh is not None else None
         )
@@ -2295,6 +2328,10 @@ class FilamentOptimizer:
         )
         if not _skip_legacy:
             _step_done("Reducing layers")
+        if self.guidance is not None:
+            _, dh = self.get_discretized_solution(best=True)
+            if dh is not None:
+                self.guidance.sync_top(dh)
 
         if _wait_if_paused():
             return False
@@ -2964,6 +3001,9 @@ class FilamentOptimizer:
                 )
                 losses.append(_candidate_loss(self, eff, cols, tds))
             losses_t = torch.stack(losses)
+        gc = self.guidance_cost(cands, getattr(eff, "_af_z", None))
+        if gc is not None:
+            losses_t = losses_t + gc
         del eff
         best_loss_t, best_i = torch.min(losses_t, dim=0)
         best_loss = float(best_loss_t)  # the one host sync
@@ -3102,7 +3142,17 @@ class FilamentOptimizer:
                     target=self.target,
                     focus_map=self.focus_map,
                     alpha=self.alpha,
-                ).item()
+                )
+                if self.guidance is not None:
+                    from autoforge.Helper.PruningHelper import _heights_from_logits
+
+                    z_g = z_assigned if own_heights else _heights_from_logits(
+                        effective_logits, self.max_layers, self.h, tau_g
+                    )
+                    gc = self.guidance_cost(disc_global, z_g)
+                    if gc is not None:
+                        current_disc_loss = current_disc_loss + gc
+                current_disc_loss = current_disc_loss.item()
 
                 if current_disc_loss < self.best_discrete_loss:
                     self.best_discrete_loss = current_disc_loss
@@ -3165,6 +3215,15 @@ class FilamentOptimizer:
         best_seed = None
         best_loss = start_loss
         global_logits = self.best_params["global_logits"]
+        guided = self.guidance is not None and self.guidance.active
+        if guided:
+            from autoforge.Helper.PruningHelper import _heights_from_logits
+
+            with torch.no_grad():
+                z_g = _heights_from_logits(
+                    self._apply_height_offset(self.best_params["pixel_height_logits"], self.best_params["height_offsets"]),
+                    self.max_layers, self.h, self.vis_tau,
+                )
         # Batch the per-layer noise-generation + material-selection step
         # across a group of candidate seeds at once (still composing/scoring
         # one candidate at a time - only the L-iteration Python loop's
@@ -3196,7 +3255,11 @@ class FilamentOptimizer:
                         target=self.target,
                         focus_map=self.focus_map,
                         alpha=self.alpha,
-                    ).item()
+                    )
+                    if guided:
+                        dg_b = self._stack_of_selection(cols_b[b], tds_b[b])
+                        current_disc_loss = current_disc_loss + self.guidance_cost(dg_b, z_g)
+                    current_disc_loss = current_disc_loss.item()
                     if current_disc_loss < best_loss:
                         best_loss = current_disc_loss
                         best_seed = int(seed)
@@ -3243,7 +3306,10 @@ class FilamentOptimizer:
                     target=self.target,
                     focus_map=self.focus_map,
                     alpha=self.alpha,
-                ).item()
+                )
+                if guided:
+                    verified_loss = verified_loss + self.guidance_cost(disc_global, z_g)
+                verified_loss = verified_loss.item()
             if verified_loss < start_loss:
                 best_loss = verified_loss
             else:
@@ -3253,6 +3319,13 @@ class FilamentOptimizer:
         if autoset_seed and best_seed is not None and best_loss < start_loss:
             self.best_seed = best_seed
         return best_seed, best_loss
+
+    def _stack_of_selection(self, cols: torch.Tensor, tds: torch.Tensor) -> torch.Tensor:
+        """[L] material indices of a per-layer selection (colours [L,3],
+        TDs [L]) - the filament each selected layer is."""
+        d = (cols.unsqueeze(1) - self.material_colors.unsqueeze(0)).abs().sum(-1)
+        d = d + (tds.view(-1, 1) - self.material_TDs.view(1, -1)).abs()
+        return d.argmin(dim=1)
 
     def __del__(self):
         """

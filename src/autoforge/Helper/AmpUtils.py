@@ -30,9 +30,14 @@ def _probe_backward(device: torch.device, dtype: torch.dtype) -> bool:
     here.
     """
     try:
-        x = torch.randn(8, 8, device=device, dtype=torch.float32, requires_grad=False)
-        w = torch.randn(8, 8, device=device, dtype=torch.float32, requires_grad=True)
-        target = torch.randn(8, 8, device=device, dtype=torch.float32)
+        # Fixed inputs, not torch.randn: the probe runs once per process, and
+        # drawing from the device's generator there shifted the random
+        # stream of only the first run - the same seed gave a different
+        # result in the first webui job than in every later one.
+        base = torch.linspace(-1.0, 1.0, 64, device=device, dtype=torch.float32).view(8, 8)
+        x = base.clone()
+        w = base.t().contiguous().requires_grad_(True)
+        target = base.flip(0)
         with torch.autocast(device_type=device.type, dtype=dtype):
             y = x @ w
             loss = torch.nn.functional.mse_loss(y, target)

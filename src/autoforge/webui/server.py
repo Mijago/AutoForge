@@ -140,6 +140,13 @@ async def lifespan(app: FastAPI):
         from .services.catalog_service import get_catalog_service
         get_catalog_service().start_background_update()
 
+    if config.preload_depth_model:
+        import threading
+
+        from autoforge.Helper.HeightGuidance import preload_depth_model
+
+        threading.Thread(target=preload_depth_model, name="depth-model-preload", daemon=True).start()
+
     yield
     flush_telemetry()
 
@@ -181,6 +188,7 @@ def create_app() -> FastAPI:
     from .api.sliders import router as sliders_router
     from .api.preview import router as preview_router
     from .api.system import router as system_router
+    from .api.guidance import router as guidance_router
 
     app.include_router(filaments_router, prefix="/api/filaments", tags=["filaments"])
     app.include_router(images_router, prefix="/api/images", tags=["images"])
@@ -195,6 +203,7 @@ def create_app() -> FastAPI:
     app.include_router(sliders_router, prefix="/api/sliders", tags=["sliders"])
     app.include_router(preview_router, prefix="/api/preview", tags=["preview"])
     app.include_router(system_router, prefix="/api/system", tags=["system"])
+    app.include_router(guidance_router, prefix="/api/guidance", tags=["guidance"])
 
     app.mount("/uploads", StaticFiles(directory=config.uploads_path), name="uploads")
 

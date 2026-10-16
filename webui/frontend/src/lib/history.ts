@@ -217,6 +217,8 @@ const SETTING_NAMES: Record<string, string> = {
   max_colors: 'color limit',
   max_swaps: 'swap limit',
   priority_mask_strength: 'focus strength',
+  height_guidance: 'height guidance',
+  height_regions: 'height regions',
 }
 
 /** Plain-language name of a settings key ("layer height"). */
