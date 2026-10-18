@@ -1336,7 +1336,30 @@ def composite_image_disc(
     layer_chunk: int = 25,
 ) -> torch.Tensor:
     """Discrete counterpart of `composite_image_cont` (see
-    ``_composite_image_disc``); repeated calls replay a CUDA graph."""
+    ``_composite_image_disc``).
+
+    It runs at full *output* resolution in every pruning phase and preview,
+    which made its [k,H,W] chunks the pipeline's VRAM high-water mark. On CUDA
+    with Triton the fused kernel walks each pixel's stack in registers instead
+    (see FusedComposite): nothing per layer is kept, and it is fp32 throughout
+    - ``compute_dtype`` does not apply - so it agrees with the torch path to
+    rounding. Otherwise repeated calls replay a CUDA graph of the torch path."""
+    from autoforge.Helper import FusedComposite as fc
+
+    # The kernel has no backward; the colours/TDs/background are the only
+    # inputs a gradient could reach here (the heights are rounded).
+    needs_grad = torch.is_grad_enabled() and any(
+        torch.is_tensor(t) and t.requires_grad for t in (material_colors, material_TDs, background)
+    )
+    if fc.fused_available(pixel_height_logits) and not ABLATION_BEER_LAMBERT_OPACITY and not needs_grad:
+        z_int, sel = _disc_heights_and_materials(
+            pixel_height_logits, global_logits, float(tau_height), float(tau_global), float(h),
+            int(max_layers), int(rng_seed),
+        )
+        return fc.composite_heights(
+            z_int, fc.stack_params(sel, material_colors, material_TDs, background, h),
+            fc.background_tensor(background), h,
+        )
 
     def run(pl, gl, mc, mt, bg, tau_h, tau_g, h_, n_layers, seed, dtype, chunk, bleed):
         return _composite_image_disc(
@@ -1356,6 +1379,36 @@ def composite_image_disc(
         int(layer_chunk),
         get_edge_bleed(),
     )
+
+
+@torch.jit.script
+def _disc_heights_and_materials(
+    pixel_height_logits: torch.Tensor,  # [H,W]
+    global_logits: torch.Tensor,  # [max_layers, n_materials]
+    tau_height: float,
+    tau_global: float,
+    h: float,
+    max_layers: int,
+    rng_seed: int = -1,
+):
+    """Steps 1-2 of ``_composite_image_disc``: the [H,W] int64 whole-layer
+    heights and the [L] material index of every layer."""
+    # 1. Discretise per-pixel heights (top of printed stack in units of h).
+    pixel_height: torch.Tensor = (float(max_layers) * h) * torch.sigmoid(
+        pixel_height_logits
+    )
+    z_cont: torch.Tensor = pixel_height / h
+    #   Adaptive rounding: low_tau=0 means perfectly hard when tau_height→0,
+    #   high_tau=1 gives fully soft when tau_height→1.  temp=0.1 sets the
+    #   sharpness of the sigmoid used inside adaptive_round.
+    z_disc: torch.Tensor = adaptive_round(z_cont, tau_height, 1.0, 0.0, 0.1)
+    z_disc = torch.clamp(z_disc, 0.0, float(max_layers))
+    z_int: torch.Tensor = torch.round(z_disc).to(torch.int64)  # [H, W]
+
+    # 2. Pick one material for every layer with a deterministic Gumbel-Softmax.
+    seed_base: int = rng_seed if rng_seed >= 0 else 0
+    sel = batched_layer_material_indices(global_logits, tau_global, seed_base)  # [L]
+    return z_int, sel
 
 
 @torch.jit.script
@@ -1383,26 +1436,10 @@ def _composite_image_disc(
       discrete in both height and color while gradients still flow
       through the soft procedures when temperatures are >0.
     """
-    eps: float = 1e-8
-
-    # 1. Discretise per-pixel heights (top of printed stack in units of h).
-    pixel_height: torch.Tensor = (float(max_layers) * h) * torch.sigmoid(
-        pixel_height_logits
+    # 1-2. Whole-layer heights and one material per layer.
+    z_int, sel = _disc_heights_and_materials(
+        pixel_height_logits, global_logits, tau_height, tau_global, h, max_layers, rng_seed
     )
-    z_cont: torch.Tensor = pixel_height / h
-    #   Adaptive rounding: low_tau=0 means perfectly hard when tau_height→0,
-    #   high_tau=1 gives fully soft when tau_height→1.  temp=0.1 sets the
-    #   sharpness of the sigmoid used inside adaptive_round.
-    z_disc: torch.Tensor = adaptive_round(z_cont, tau_height, 1.0, 0.0, 0.1)
-    z_disc = torch.clamp(z_disc, 0.0, float(max_layers))
-    z_int: torch.Tensor = torch.round(z_disc).to(torch.int64)  # [H, W]
-
-    # 2. Pick one material for every layer with a deterministic Gumbel-Softmax.
-    L: int = int(global_logits.shape[0])
-    n_mat: int = int(global_logits.shape[1])
-
-    seed_base: int = rng_seed if rng_seed >= 0 else 0
-    sel = batched_layer_material_indices(global_logits, tau_global, seed_base)  # [L]
     layer_colors = material_colors.index_select(0, sel)  # [L,3]
     layer_TDs = material_TDs.index_select(0, sel).clamp(1e-8, 1e8)  # [L]
 
@@ -1426,7 +1463,7 @@ def _composite_image_disc(
     W_out: int = int(z_int.shape[1])
     comp = background.to(torch.float32).view(1, 1, 3).expand(H_out, W_out, 3)
     carry_thick = torch.zeros(
-        (H_out, W_out), dtype=torch.float32, device=pixel_height.device
+        (H_out, W_out), dtype=torch.float32, device=pixel_height_logits.device
     )
     carry_cov = torch.zeros_like(carry_thick)
 
@@ -1435,9 +1472,9 @@ def _composite_image_disc(
         hi: int = lo + layer_chunk
         if hi > max_layers:
             hi = max_layers
-        idx = torch.arange(lo, hi, dtype=torch.int64, device=pixel_height.device)
+        idx = torch.arange(lo, hi, dtype=torch.int64, device=pixel_height_logits.device)
         p_print = (idx.view(-1, 1, 1) < z_int.unsqueeze(0)).to(
-            pixel_height.dtype
+            pixel_height_logits.dtype
         )  # [k,H,W] bottom to top
 
         # See composite_image_cont: @torch.jit.script does not observe
